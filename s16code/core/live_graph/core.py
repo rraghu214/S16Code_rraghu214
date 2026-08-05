@@ -60,6 +60,7 @@ class Event:
     kind: str
     node_id: str | None
     payload: dict[str, Any]
+    recorded_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -74,7 +75,19 @@ class Planner(Protocol):
     async def plan(self, graph: GraphSnapshot, event: Event) -> GraphPatch: ...
 
 
-Skill = Callable[[TaskSpec], Awaitable[dict[str, Any]]]
+@dataclass(frozen=True)
+class Deferred:
+    """A launched operation that will complete through a later event."""
+
+    handle: str
+    event_type: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def as_wait(self) -> dict[str, Any]:
+        return {"handle": self.handle, "event_type": self.event_type, **self.metadata}
+
+
+Skill = Callable[[TaskSpec], Awaitable[dict[str, Any] | Deferred]]
 
 
 @dataclass(frozen=True)
@@ -113,7 +126,7 @@ class LiveGraphExecutor:
         await self._replay_pending_planner_events(run_id)
 
         executed: list[str] = []
-        in_flight: dict[asyncio.Task[tuple[TaskSpec, bool, dict[str, Any]]], TaskSpec] = {}
+        in_flight: dict[asyncio.Task[tuple[TaskSpec, bool, dict[str, Any] | Deferred]], TaskSpec] = {}
         while True:
             # Fill free worker slots before waiting.  Crucially, after *one*
             # task completes below we come back here and can launch work from
@@ -153,8 +166,11 @@ class LiveGraphExecutor:
                 # not an execution race the worker gets to win.
                 if self.store.node_state(run_id, task.id) == NodeState.CANCELLED:
                     continue
-                event = self.store.record_outcome(run_id, completed_task.id, success, payload)
                 executed.append(completed_task.id)
+                if isinstance(payload, Deferred):
+                    self.store.record_waiting(run_id, completed_task.id, payload.as_wait())
+                    continue
+                event = self.store.record_outcome(run_id, completed_task.id, success, payload)
                 if not self.store.is_finished(run_id):
                     await self._plan(run_id, event)
                     self._cancel_graph_cancelled_tasks(run_id, in_flight)
@@ -169,7 +185,7 @@ class LiveGraphExecutor:
                 self._cancel_graph_cancelled_tasks(run_id, in_flight, cancel_all=True)
         return self._report(run_id, executed)
 
-    async def _execute(self, task: TaskSpec) -> tuple[TaskSpec, bool, dict[str, Any]]:
+    async def _execute(self, task: TaskSpec) -> tuple[TaskSpec, bool, dict[str, Any] | Deferred]:
         worker = self.skills.get(task.skill)
         if worker is None:
             return task, False, {"error": f"unknown skill: {task.skill}"}
@@ -181,7 +197,7 @@ class LiveGraphExecutor:
     def _cancel_graph_cancelled_tasks(
         self,
         run_id: str,
-        in_flight: dict[asyncio.Task[tuple[TaskSpec, bool, dict[str, Any]]], TaskSpec],
+        in_flight: dict[asyncio.Task[tuple[TaskSpec, bool, dict[str, Any] | Deferred]], TaskSpec],
         *,
         cancel_all: bool = False,
     ) -> None:

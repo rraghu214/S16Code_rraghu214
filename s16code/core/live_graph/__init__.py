@@ -1,6 +1,7 @@
 """The durable, event-driven task graph used by S15 core."""
 
 from .core import (
+    Deferred,
     Event,
     GraphPatch,
     GraphSnapshot,
@@ -11,6 +12,6 @@ from .core import (
 from .store import GraphStore
 
 __all__ = [
-    "Event", "GraphPatch", "GraphSnapshot", "GraphStore",
+    "Deferred", "Event", "GraphPatch", "GraphSnapshot", "GraphStore",
     "LiveGraphExecutor", "NodeState", "TaskSpec",
 ]

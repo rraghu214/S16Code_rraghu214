@@ -79,7 +79,7 @@ async def test_discovered_urls_can_be_fetched_on_the_next_round():
 
 
 @pytest.mark.asyncio
-async def test_synthesis_waits_for_every_active_evidence_sibling():
+async def test_planner_may_expand_from_one_outcome_while_a_sibling_is_running():
     nodes = {
         "a": {"id": "a", "skill": "researcher", "input": {}, "metadata": {},
               "state": "succeeded", "result": {"text": "A"}},
@@ -93,8 +93,8 @@ async def test_synthesis_waits_for_every_active_evidence_sibling():
     )
     planner = GeneralAgentPlanner(reply, default_registry(), goal="Compare A and B", review_terminal=False)
     patch = await planner.plan(snapshot(nodes), Event(4, "task_succeeded", "a", {"text": "A"}))
-    assert not patch.add
-    assert "held distiller" in patch.reason
+    assert [task.id for task in patch.add] == ["too_early"]
+    assert patch.connect == (("a", "too_early"),)
 
 
 @pytest.mark.asyncio
@@ -112,7 +112,7 @@ async def test_reproposing_identical_active_work_is_normalized_to_wait():
 
 
 @pytest.mark.asyncio
-async def test_partial_frontier_outcome_does_not_spawn_an_unbounded_second_wave():
+async def test_partial_frontier_outcome_can_earn_one_bounded_follow_up():
     nodes = {
         "listing": {"id": "listing", "skill": "researcher", "input": {}, "metadata": {},
                     "state": "succeeded", "result": {"text": "candidate"}},
@@ -125,8 +125,9 @@ async def test_partial_frontier_outcome_does_not_spawn_an_unbounded_second_wave(
     planner = GeneralAgentPlanner(reply, default_registry(), goal="Compare a product",
                                   review_terminal=False)
     patch = await planner.plan(snapshot(nodes), Event(4, "task_succeeded", "listing", {"text": "candidate"}))
-    assert not patch.add
-    assert "active frontier finishes" in patch.reason
+    assert [task.id for task in patch.add] == ["warranty"]
+    assert patch.connect == (("listing", "warranty"),)
+    assert len(patch.add) <= planner.max_new_tasks
 
 
 @pytest.mark.asyncio
@@ -177,6 +178,17 @@ async def test_side_effect_requires_explicit_run_authority():
     patch = await planner.plan(snapshot(), Event(1, "run_started", None, {}))
     assert [task.skill for task in patch.add] == ["answer_with_evidence"]
     assert "lacks explicit run authority" in planner.history[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_capability_keyed_provider_shorthand_is_normalized_generically():
+    reply = Replies({"answer_with_evidence": {"query": "Return the completed job receipt."}})
+    planner = GeneralAgentPlanner(reply, default_registry(), goal="Return the receipt.",
+                                  review_terminal=False)
+    patch = await planner.plan(snapshot(), Event(1, "run_started", None, {}))
+    assert [(task.skill, task.input) for task in patch.add] == [
+        ("answer_with_evidence", {"query": "Return the completed job receipt."})
+    ]
 
 
 def test_runtime_contains_no_prompt_router_or_benchmark_case_logic():

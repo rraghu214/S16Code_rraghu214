@@ -18,6 +18,7 @@ dependencies = [
     "opentelemetry-sdk>=1.27",
     "opentelemetry-exporter-otlp>=1.27",
     "ddgs>=9,<10",
+    "networkx>=3.6,<4",
 ]
 
 [dependency-groups]

@@ -139,6 +139,10 @@ class CapabilityRegistry:
             parsed = urlparse(clean["agent_url"])
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise CapabilityError("a2a_delegate.agent_url must be an absolute http(s) URL")
+        if name == "launch_job":
+            parsed = urlparse(clean["endpoint"])
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise CapabilityError("launch_job.endpoint must be an absolute http(s) URL")
         return clean
 
 
@@ -206,6 +210,15 @@ def default_registry() -> CapabilityRegistry:
         Capability("a2a_delegate", "Discover a remote A2A agent, verify its Agent Card under local trust policy, and delegate one task.",
                    {"agent_url": string("Base URL of the remote agent.", maximum=4_000),
                     "message": string("Self-contained delegated task.", maximum=20_000)}, role="delegate"),
+        Capability("launch_job", "Launch any program or agent that implements the asynchronous job contract. It returns immediately with a durable handle; a later signed completion event resumes this graph.",
+                   {"endpoint": string("HTTP(S) endpoint that accepts the generic job envelope.", maximum=4_000),
+                    "task": string("Self-contained work request, with desired output contract.", maximum=20_000)},
+                   role="delegate", side_effect=True),
+        Capability("request_approval", "Pause this run and ask a human one concrete question before an irreversible or ambiguous action. A later approval event resumes from the response.",
+                   {"question": string("Decision the human must make, including relevant consequences.", maximum=4_000),
+                    "choices": Argument("array", "Short allowed responses.", required=False,
+                                        maximum=10, item_kind="string")},
+                   role="approval", side_effect=True),
         Capability("retriever", "Retrieve scoped memory and have a specialist summarize only the retrieved evidence.",
                    {"query": string("A precise retrieval question.", maximum=20_000)}, role="retriever"),
         Capability("distiller", "Synthesize completed upstream outcomes into the information needed by the goal.",

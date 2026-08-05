@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from s16code.core.live_graph import GraphPatch, GraphStore, LiveGraphExecutor, TaskSpec
+from s16code.core.live_graph import Deferred, GraphPatch, GraphStore, LiveGraphExecutor, TaskSpec
 
 
 class ScriptedPlanner:
@@ -201,3 +201,47 @@ async def test_resume_replays_outcome_that_crashed_before_its_patch(tmp_path):
     assert done.finished and done.executed == ("second",)
     assert store.pending_planner_events("crash-gap") == []
     assert len([event for event in store.events("crash-gap") if event.kind == "graph_patched" and event.payload["trigger_event"] == outcome.sequence]) == 1
+
+
+@pytest.mark.asyncio
+async def test_deferred_work_frees_worker_then_external_event_resumes_after_restart(tmp_path):
+    """Launch -> durable wait -> event -> outcome-driven expansion, with no polling worker."""
+    def plan(graph, event):
+        if event.kind == "run_started":
+            return GraphPatch(add=(TaskSpec("remote", "launch"),))
+        if event.node_id == "remote":
+            assert event.payload == {"finding": "completed elsewhere"}
+            return GraphPatch(add=(TaskSpec("use_result", "local"),),
+                              connect=(("remote", "use_result"),))
+        return GraphPatch(finish=True)
+
+    async def launch(_task):
+        return Deferred("job-73", "program.completed", {"provider": "proof-worker"})
+
+    async def local(_task):
+        return {"answer": "used the external result"}
+
+    graph_dir = tmp_path / "graph.json"
+    first_store = GraphStore(graph_dir)
+    first = await LiveGraphExecutor(first_store, ScriptedPlanner(plan), {"launch": launch}).run("durable-wait")
+    assert not first.finished and first.waiting == ("remote",)
+    assert first_store.snapshot("durable-wait").nodes["remote"]["wait"]["handle"] == "job-73"
+
+    # A fresh store object represents a new process. Duplicate delivery is a
+    # no-op because only a currently waiting node can consume a completion.
+    restarted = GraphStore(graph_dir)
+    completion = restarted.complete_waiting(
+        "job-73", "program.completed", {"finding": "completed elsewhere"}
+    )
+    assert completion is not None
+    assert restarted.complete_waiting(
+        "job-73", "program.completed", {"finding": "duplicate"}
+    ) is None
+
+    done = await LiveGraphExecutor(
+        restarted, ScriptedPlanner(plan), {"launch": launch, "local": local}
+    ).run("durable-wait", resume=True)
+    assert done.finished and done.executed == ("use_result",)
+    kinds = [event.kind for event in restarted.events("durable-wait")]
+    assert kinds.count("external_event_received") == 1
+    assert kinds.count("task_waiting") == 1

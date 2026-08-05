@@ -24,7 +24,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .agui import run_data_model, state_snapshot, stream_agui
+from .agui import run_data_model, state_snapshot, to_agui_event
 from .catalog import catalog_manifest
 from .hitl import PendingAction, decide_resume
 from .surface import build_run_surface
@@ -100,7 +100,7 @@ async def snapshot(run_id: str, request: Request):
 
 
 @router.get("/v1/runs/{run_id}/events")
-async def events(run_id: str, request: Request, reconnect: int = 0):
+async def events(run_id: str, request: Request, reconnect: int = 0, after: int = 0):
     run = _read_run(request, run_id)
     # On reconnect the stream leads with ONE STATE_SNAPSHOT carrying the full
     # current data model; the client rebuilds from that single frame rather than
@@ -108,9 +108,21 @@ async def events(run_id: str, request: Request, reconnect: int = 0):
     snap = run_data_model(run) if reconnect else None
 
     async def gen():
-        for ev in stream_agui(run["events"], finished=run["finished"], snapshot=snap):
-            yield f"data: {json.dumps(ev)}\n\n"
-            await asyncio.sleep(0.25)  # pace the tape so a browser can render it
+        cursor = after
+        if snap is not None:
+            yield f"data: {json.dumps(state_snapshot(snap, seq=cursor))}\n\n"
+        while not await request.is_disconnected():
+            current = _read_run(request, run_id)
+            fresh = [event for event in current["events"] if event["sequence"] > cursor]
+            for event in fresh:
+                cursor = event["sequence"]
+                yield f"id: {cursor}\ndata: {json.dumps(to_agui_event(event))}\n\n"
+            if current["finished"]:
+                yield f"data: {json.dumps({'type': 'RUN_FINISHED', 'seq': cursor + 1, 'source_kind': 'derived'})}\n\n"
+                break
+            if not fresh:
+                yield ": keepalive\n\n"
+            await asyncio.sleep(0.25)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -141,13 +153,34 @@ class ActionBody(BaseModel):
 
 
 @router.post("/v1/action")
-async def action(body: ActionBody):
-    pending = PendingAction(body.run_id, body.node_id, body.pending_summary, body.pending_params)
+async def action(body: ActionBody, request: Request):
+    try:
+        node = request.app.state.runtime.graph.snapshot(body.run_id).nodes[body.node_id]
+    except (KeyError, TypeError):
+        raise HTTPException(404, "waiting graph node not found") from None
+    if node.get("state") != "waiting" or not isinstance(node.get("wait"), dict):
+        raise HTTPException(409, "graph node is not waiting for a decision")
+    wait = node["wait"]
+    # The binding comes from the durable node, never from client-supplied
+    # pending_params. Event payload cannot rewrite what the agent asked.
+    bound = wait.get("params") if isinstance(wait.get("params"), dict) else {}
+    pending = PendingAction(body.run_id, body.node_id, str(wait.get("question", "")), bound)
     decision = decide_resume(pending, body.action, body.args)
     if not decision.allowed:
         # A tamper attempt is refused; the node stays waiting.
         raise HTTPException(409, decision.reason)
-    return {"resumed": True, "node_id": body.node_id, "reason": decision.reason}
+    completion = request.app.state.runtime.graph.complete_waiting(
+        str(wait["handle"]), str(wait["event_type"]),
+        {"action": body.action, "args": body.args}, success=body.action == "approve",
+    )
+    if completion is None:
+        return {"resumed": False, "duplicate": True, "node_id": body.node_id}
+    result = await request.app.state.runtime.run(
+        prompt=None, scope=None,
+        llm=lambda prompt, system: request.app.state.gateway.complete(prompt, system),
+        source_uri=None, source_author=None, run_id=body.run_id, resume=True,
+    )
+    return {"resumed": True, "node_id": body.node_id, "reason": decision.reason, "run": result}
 
 
 @router.get("/v1/runs/{run_id}/composed")

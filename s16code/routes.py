@@ -1,7 +1,11 @@
 """Local agent-runtime endpoints."""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request
+import hmac
+import os
+from typing import Any
+
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from s16code.core.memory import MemoryKind, MemoryScope, Principal
@@ -40,6 +44,13 @@ class RunBody(ScopeBody):
 
 class ResumeBody(BaseModel):
     run_id: str = Field(min_length=1, max_length=128)
+
+
+class CompletionBody(BaseModel):
+    handle: str = Field(min_length=1, max_length=500)
+    event_type: str = Field(default="job.completed", min_length=1, max_length=200)
+    success: bool = True
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class FactBody(ScopeBody):
@@ -88,6 +99,31 @@ async def resume(run_id: str, request: Request):
         raise HTTPException(404, "run not found") from None
     except RuntimeError as error:
         raise HTTPException(503, str(error)) from error
+
+
+@router.post("/completions")
+async def complete_waiting_job(body: CompletionBody, request: Request,
+                               authorization: str | None = Header(default=None)):
+    """Consume an idempotent completion and continue from its real outcome."""
+    expected = os.getenv("S16_COMPLETION_TOKEN")
+    supplied = (authorization or "").removeprefix("Bearer ")
+    if expected and not hmac.compare_digest(supplied, expected):
+        raise HTTPException(401, "invalid completion token")
+    runtime = request.app.state.runtime
+    completion = runtime.graph.complete_waiting(
+        body.handle, body.event_type, body.payload, success=body.success
+    )
+    if completion is None:
+        # The same response is safe for an unknown and an already-consumed
+        # handle: callers can retry without learning internal run identifiers.
+        return {"accepted": False, "duplicate_or_unknown": True}
+    run_id, node_id, _ = completion
+    result = await runtime.run(
+        prompt=None, scope=None,
+        llm=lambda prompt, system: gateway_text_llm(request.app, prompt, system),
+        source_uri=None, source_author=None, run_id=run_id, resume=True,
+    )
+    return {"accepted": True, "run_id": run_id, "node_id": node_id, "run": result}
 
 
 @router.post("/facts")

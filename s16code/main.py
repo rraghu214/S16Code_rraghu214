@@ -26,6 +26,8 @@ from s16code.core.a2a.official import OfficialA2AServer  # noqa: E402
 from s16code.core.a2a.server import A2ADemoServer  # noqa: E402
 from s16code.core.a2a.trust import sign_card  # noqa: E402
 from s16code.core.memory import MemoryScope  # noqa: E402
+from s16code.events import AutonomousEventEngine, EventStore  # noqa: E402
+from s16code.events.routes import router as events_router  # noqa: E402
 from s16code.gateway import GatewayClient  # noqa: E402
 from s16code.runtime import AgentRuntime  # noqa: E402
 from s16code.ui.routes import router as ui_router  # noqa: E402
@@ -42,6 +44,8 @@ async def lifespan(app: FastAPI):
     app.state.gateway = GatewayClient()
     app.state.runtime = AgentRuntime()
     data_dir = app.state.runtime.root
+    app.state.event_store = EventStore(data_dir / "events")
+    app.state.event_engine = AutonomousEventEngine(app.state.event_store, app.state.runtime)
     bearers, api_keys = _secrets("S16_A2A_BEARER_TOKENS"), _secrets("S16_A2A_API_KEYS")
     base_url = os.getenv("S16_BASE_URL", f"http://127.0.0.1:{PORT}").rstrip("/")
     card = {
@@ -127,6 +131,7 @@ app = FastAPI(title="S16Code — Live Graph, Memory, Semantic Chunking and A2A",
 app.include_router(routes.router)
 app.include_router(a2a_routes.router)
 app.include_router(ui_router)
+app.include_router(events_router)
 
 
 @app.get("/healthz")

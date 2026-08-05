@@ -1,11 +1,18 @@
-"""SQLite event journal and materialised graph state for live graphs."""
+"""NetworkX live graphs persisted as one atomic JSON checkpoint per run."""
 
 from __future__ import annotations
 
+import hashlib
 import json
-import sqlite3
+import os
+import tempfile
+import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+import networkx as nx
+from networkx.readwrite import json_graph
 
 from .core import Event, GraphPatch, GraphSnapshot, NodeState, TaskSpec
 
@@ -15,235 +22,286 @@ class GraphMutationError(ValueError):
 
 
 class GraphStore:
-    """Durable graph storage. A patch and its journal entry commit together."""
+    """A small, inspectable graph store without a second database.
+
+    NetworkX is the graph engine. JSON is only its durable envelope. Every
+    mutation replaces one run checkpoint atomically, which is enough for the
+    laptop-sized autonomous runs this harness teaches.
+    """
+
+    FORMAT = "s16-networkx-run-v1"
 
     def __init__(self, path: str | Path):
-        self.path = str(path)
-        # FastAPI's test/client boundary (and a local server's worker thread)
-        # may resume a durable run from a different thread than construction.
-        # Graph mutations remain transaction-scoped; callers do not share a
-        # patch transaction across awaits.
-        self.db = sqlite3.connect(self.path, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys = ON")
-        self._create_schema()
+        # Older callers use names such as graph.sqlite. Keep that public API,
+        # but the path is now a directory containing one JSON file per run.
+        self.path = Path(path)
+        self.path.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
 
     def close(self) -> None:
-        self.db.close()
+        """There is no connection to close."""
 
-    def _create_schema(self) -> None:
-        self.db.executescript("""
-        CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, finished INTEGER NOT NULL DEFAULT 0,
-                                         context_json TEXT NOT NULL DEFAULT '{}');
-        CREATE TABLE IF NOT EXISTS nodes (
-          run_id TEXT NOT NULL, id TEXT NOT NULL, skill TEXT NOT NULL,
-          input_json TEXT NOT NULL, metadata_json TEXT NOT NULL,
-          state TEXT NOT NULL, result_json TEXT,
-          PRIMARY KEY (run_id, id), FOREIGN KEY (run_id) REFERENCES runs(id));
-        CREATE TABLE IF NOT EXISTS edges (
-          run_id TEXT NOT NULL, parent_id TEXT NOT NULL, child_id TEXT NOT NULL,
-          PRIMARY KEY (run_id, parent_id, child_id), FOREIGN KEY (run_id) REFERENCES runs(id));
-        CREATE TABLE IF NOT EXISTS events (
-          sequence INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
-          kind TEXT NOT NULL, node_id TEXT, payload_json TEXT NOT NULL,
-          FOREIGN KEY (run_id) REFERENCES runs(id));
-        CREATE TABLE IF NOT EXISTS patches (
-          run_id TEXT NOT NULL, trigger_event INTEGER NOT NULL, patch_json TEXT NOT NULL,
-          PRIMARY KEY (run_id, trigger_event), FOREIGN KEY (run_id) REFERENCES runs(id));
-        """)
-        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(runs)")}
-        if "context_json" not in columns:
-            self.db.execute("ALTER TABLE runs ADD COLUMN context_json TEXT NOT NULL DEFAULT '{}'")
-        self.db.commit()
+    def _path(self, run_id: str) -> Path:
+        return self.path / f"{hashlib.sha256(run_id.encode()).hexdigest()}.json"
+
+    @staticmethod
+    def _new(run_id: str, context: dict[str, Any]) -> dict[str, Any]:
+        graph = nx.DiGraph()
+        graph.graph.update(run_id=run_id, finished=False, context=context)
+        return {"format": GraphStore.FORMAT, "version": 0, "graph": graph,
+                "events": [], "applied_triggers": {}}
+
+    def _load(self, run_id: str) -> dict[str, Any]:
+        path = self._path(run_id)
+        if not path.exists():
+            raise KeyError(run_id)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if raw.get("format") != self.FORMAT:
+            raise GraphMutationError(f"unsupported graph checkpoint: {path}")
+        raw["graph"] = json_graph.node_link_graph(raw["graph"], edges="edges")
+        if raw["graph"].graph.get("run_id") != run_id:
+            raise GraphMutationError("checkpoint run id does not match its lookup key")
+        return raw
+
+    def _save(self, state: dict[str, Any]) -> None:
+        graph: nx.DiGraph = state["graph"]
+        path = self._path(str(graph.graph["run_id"]))
+        serial = {**state, "version": int(state["version"]) + 1,
+                  "graph": json_graph.node_link_data(graph, edges="edges")}
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.stem}-", suffix=".tmp", dir=self.path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(serial, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        state["version"] = serial["version"]
+
+    @staticmethod
+    def _event(state: dict[str, Any], kind: str, node_id: str | None,
+               payload: dict[str, Any]) -> Event:
+        raw = {"sequence": len(state["events"]) + 1, "kind": kind, "node_id": node_id,
+               "payload": payload, "recorded_at": datetime.now(UTC).isoformat()}
+        state["events"].append(raw)
+        return Event(**raw)
+
+    @staticmethod
+    def _as_event(raw: dict[str, Any]) -> Event:
+        return Event(raw["sequence"], raw["kind"], raw.get("node_id"), raw["payload"],
+                     raw.get("recorded_at"))
 
     def start(self, run_id: str, *, context: dict[str, Any] | None = None) -> bool:
-        with self.db:
-            cursor = self.db.execute("INSERT OR IGNORE INTO runs(id, context_json) VALUES (?, ?)",
-                                     (run_id, json.dumps(context or {})))
-            if cursor.rowcount:
-                self._event(run_id, "run_started", None, {})
-                return True
-        return False
+        with self._lock:
+            if self._path(run_id).exists():
+                return False
+            state = self._new(run_id, context or {})
+            self._event(state, "run_started", None, {})
+            self._save(state)
+            return True
 
     def context(self, run_id: str) -> dict[str, Any]:
-        row = self.db.execute("SELECT context_json FROM runs WHERE id=?", (run_id,)).fetchone()
-        if not row:
-            raise KeyError(run_id)
-        return json.loads(row["context_json"])
+        with self._lock:
+            return dict(self._load(run_id)["graph"].graph.get("context", {}))
 
     def resume(self, run_id: str) -> None:
-        with self.db:
-            found = self.db.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone()
-            if not found:
-                raise KeyError(f"cannot resume unknown run {run_id!r}")
-            self.db.execute("UPDATE nodes SET state=? WHERE run_id=? AND state=?",
-                            (NodeState.PENDING, run_id, NodeState.RUNNING))
-            self._event(run_id, "run_resumed", None, {})
+        with self._lock:
+            state = self._load(run_id)
+            for _, node in state["graph"].nodes(data=True):
+                if node["state"] == NodeState.RUNNING:
+                    node["state"] = NodeState.PENDING
+            self._event(state, "run_resumed", None, {})
+            self._save(state)
 
     def latest_event(self, run_id: str) -> Event | None:
-        row = self.db.execute("SELECT * FROM events WHERE run_id=? ORDER BY sequence DESC LIMIT 1", (run_id,)).fetchone()
-        return self._event_from_row(row) if row else None
+        with self._lock:
+            events = self._load(run_id)["events"]
+            return self._as_event(events[-1]) if events else None
 
     def snapshot(self, run_id: str) -> GraphSnapshot:
-        run = self.db.execute("SELECT finished FROM runs WHERE id=?", (run_id,)).fetchone()
-        if not run:
-            raise KeyError(run_id)
-        rows = self.db.execute("SELECT * FROM nodes WHERE run_id=? ORDER BY id", (run_id,)).fetchall()
-        nodes = {r["id"]: {"id": r["id"], "skill": r["skill"], "input": json.loads(r["input_json"]),
-                            "metadata": json.loads(r["metadata_json"]), "state": r["state"],
-                            "result": json.loads(r["result_json"]) if r["result_json"] else None}
-                 for r in rows}
-        edges = tuple((r["parent_id"], r["child_id"]) for r in self.db.execute(
-            "SELECT parent_id, child_id FROM edges WHERE run_id=? ORDER BY parent_id, child_id", (run_id,)))
-        return GraphSnapshot(run_id, bool(run["finished"]), nodes, edges)
+        with self._lock:
+            graph = self._load(run_id)["graph"]
+            nodes = {str(node_id): {"id": str(node_id), **dict(value)}
+                     for node_id, value in sorted(graph.nodes(data=True), key=lambda pair: str(pair[0]))}
+            edges = tuple(sorted((str(parent), str(child)) for parent, child in graph.edges))
+            return GraphSnapshot(run_id, bool(graph.graph.get("finished")), nodes, edges)
 
     def ready(self, run_id: str, *, limit: int) -> list[TaskSpec]:
-        # A task becomes ready only when every parent has actually succeeded.
-        rows = self.db.execute("""
-          SELECT n.* FROM nodes n WHERE n.run_id=? AND n.state=?
-          AND NOT EXISTS (SELECT 1 FROM edges e JOIN nodes p ON p.run_id=e.run_id AND p.id=e.parent_id
-                          WHERE e.run_id=n.run_id AND e.child_id=n.id AND p.state != ?)
-          ORDER BY n.id LIMIT ?
-        """, (run_id, NodeState.PENDING, NodeState.SUCCEEDED, limit)).fetchall()
-        return [TaskSpec(r["id"], r["skill"], json.loads(r["input_json"]), json.loads(r["metadata_json"])) for r in rows]
+        with self._lock:
+            graph = self._load(run_id)["graph"]
+            ready: list[TaskSpec] = []
+            for node_id in sorted(graph.nodes, key=str):
+                node = graph.nodes[node_id]
+                if node["state"] != NodeState.PENDING:
+                    continue
+                if all(graph.nodes[parent]["state"] == NodeState.SUCCEEDED
+                       for parent in graph.predecessors(node_id)):
+                    ready.append(TaskSpec(str(node_id), node["skill"], node["input"], node["metadata"]))
+                    if len(ready) == limit:
+                        break
+            return ready
 
     def mark_running(self, run_id: str, tasks: list[TaskSpec]) -> None:
-        with self.db:
+        with self._lock:
+            state = self._load(run_id)
+            graph = state["graph"]
             for task in tasks:
-                self.db.execute("UPDATE nodes SET state=? WHERE run_id=? AND id=? AND state=?",
-                                (NodeState.RUNNING, run_id, task.id, NodeState.PENDING))
-                self._event(run_id, "task_started", task.id,
+                if graph.nodes[task.id]["state"] != NodeState.PENDING:
+                    continue
+                graph.nodes[task.id]["state"] = NodeState.RUNNING
+                self._event(state, "task_started", task.id,
                             {"skill": task.skill, "agent": task.metadata.get("agent", task.skill)})
+            self._save(state)
 
-    def record_outcome(self, run_id: str, node_id: str, success: bool, payload: dict[str, Any]) -> Event:
-        state = NodeState.SUCCEEDED if success else NodeState.FAILED
-        with self.db:
-            row = self.db.execute("UPDATE nodes SET state=?, result_json=? WHERE run_id=? AND id=? AND state=?",
-                                  (state, json.dumps(payload), run_id, node_id, NodeState.RUNNING))
-            if row.rowcount != 1:
+    def record_outcome(self, run_id: str, node_id: str, success: bool,
+                       payload: dict[str, Any]) -> Event:
+        with self._lock:
+            state = self._load(run_id)
+            node = state["graph"].nodes[node_id]
+            if node["state"] != NodeState.RUNNING:
                 raise GraphMutationError(f"cannot record outcome for {node_id}: it is not running")
-            return self._event(run_id, "task_succeeded" if success else "task_failed", node_id, payload)
+            node["state"] = NodeState.SUCCEEDED if success else NodeState.FAILED
+            node["result"] = payload
+            event = self._event(state, "task_succeeded" if success else "task_failed", node_id, payload)
+            self._save(state)
+            return event
+
+    def record_waiting(self, run_id: str, node_id: str, wait: dict[str, Any]) -> Event:
+        """Park a launched task so it no longer consumes an executor worker."""
+        with self._lock:
+            state = self._load(run_id)
+            node = state["graph"].nodes[node_id]
+            if node["state"] != NodeState.RUNNING:
+                raise GraphMutationError(f"cannot wait {node_id}: it is not running")
+            node["state"], node["wait"] = NodeState.WAITING, wait
+            event = self._event(state, "task_waiting", node_id, wait)
+            self._save(state)
+            return event
+
+    def complete_waiting(self, handle: str, event_type: str, payload: dict[str, Any],
+                         *, success: bool = True) -> tuple[str, str, Event] | None:
+        """Complete one parked task; a duplicate delivery becomes a no-op."""
+        with self._lock:
+            matches: list[tuple[str, dict[str, Any], str]] = []
+            for path in self.path.glob("*.json"):
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                graph = json_graph.node_link_graph(raw["graph"], edges="edges")
+                for node_id, node in graph.nodes(data=True):
+                    wait = node.get("wait") or {}
+                    if (node.get("state") == NodeState.WAITING and wait.get("handle") == handle
+                            and wait.get("event_type") == event_type):
+                        raw["graph"] = graph
+                        matches.append((str(graph.graph["run_id"]), raw, str(node_id)))
+            if not matches:
+                return None
+            if len(matches) != 1:
+                raise GraphMutationError(f"wait handle {handle!r} is not unique")
+            run_id, state, node_id = matches[0]
+            node = state["graph"].nodes[node_id]
+            node["state"] = NodeState.SUCCEEDED if success else NodeState.FAILED
+            node["result"] = payload
+            node.pop("wait", None)
+            self._event(state, "external_event_received", node_id,
+                        {"handle": handle, "event_type": event_type})
+            event = self._event(state, "task_succeeded" if success else "task_failed", node_id, payload)
+            self._save(state)
+            return run_id, node_id, event
 
     def pending_planner_events(self, run_id: str) -> list[Event]:
-        """Events whose graph mutation was not committed yet."""
-        rows = self.db.execute("""
-          SELECT e.* FROM events e WHERE e.run_id=?
-          AND e.kind IN ('run_started', 'task_succeeded', 'task_failed')
-          AND NOT EXISTS (SELECT 1 FROM patches p WHERE p.run_id=e.run_id AND p.trigger_event=e.sequence)
-          ORDER BY e.sequence
-        """, (run_id,)).fetchall()
-        return [self._event_from_row(row) for row in rows]
+        with self._lock:
+            state = self._load(run_id)
+            applied = state["applied_triggers"]
+            return [self._as_event(raw) for raw in state["events"]
+                    if raw["kind"] in {"run_started", "task_succeeded", "task_failed"}
+                    and str(raw["sequence"]) not in applied]
 
     def apply_patch(self, run_id: str, patch: GraphPatch, *, trigger_event: int) -> bool:
-        with self.db:
-            if self.db.execute("SELECT 1 FROM patches WHERE run_id=? AND trigger_event=?", (run_id, trigger_event)).fetchone():
+        with self._lock:
+            state = self._load(run_id)
+            graph: nx.DiGraph = state["graph"]
+            trigger = str(trigger_event)
+            if trigger in state["applied_triggers"]:
                 return False
-            existing = self.snapshot(run_id)
-            if existing.finished:
+            if graph.graph.get("finished"):
                 raise GraphMutationError("cannot mutate a finished graph")
-            ids = set(existing.nodes)
+            existing_ids = set(graph.nodes)
             add_ids = [task.id for task in patch.add]
-            if len(add_ids) != len(set(add_ids)) or ids.intersection(add_ids):
+            if len(add_ids) != len(set(add_ids)) or existing_ids.intersection(add_ids):
                 raise GraphMutationError("patch adds duplicate task id")
-            all_ids = ids.union(add_ids)
+            all_ids = existing_ids.union(add_ids)
             for parent, child in patch.connect:
                 if parent not in all_ids or child not in all_ids:
                     raise GraphMutationError(f"edge {parent}->{child} references unknown task")
                 if parent == child:
                     raise GraphMutationError("a task cannot depend on itself")
-            for nid in (*patch.cancel, *patch.wait, *patch.resume):
-                if nid not in all_ids:
-                    raise GraphMutationError(f"patch references unknown task {nid}")
-            for nid in patch.cancel:
-                state = existing.nodes[nid]["state"]
-                if state not in (NodeState.PENDING, NodeState.WAITING, NodeState.RUNNING):
-                    raise GraphMutationError(f"can only cancel pending/waiting/running task {nid}, got {state}")
-            for nid in patch.wait:
-                if nid in ids and existing.nodes[nid]["state"] != NodeState.PENDING:
-                    raise GraphMutationError(f"can only wait pending task {nid}")
-            for nid in patch.resume:
-                if nid in ids and existing.nodes[nid]["state"] != NodeState.WAITING:
-                    raise GraphMutationError(f"can only resume waiting task {nid}")
+            for node_id in (*patch.cancel, *patch.wait, *patch.resume):
+                if node_id not in all_ids:
+                    raise GraphMutationError(f"patch references unknown task {node_id}")
+            for node_id in patch.cancel:
+                if graph.nodes[node_id]["state"] not in {
+                    NodeState.PENDING, NodeState.WAITING, NodeState.RUNNING
+                }:
+                    raise GraphMutationError(f"can only cancel active task {node_id}")
+            for node_id in patch.wait:
+                if node_id in existing_ids and graph.nodes[node_id]["state"] != NodeState.PENDING:
+                    raise GraphMutationError(f"can only wait pending task {node_id}")
+            for node_id in patch.resume:
+                if node_id in existing_ids and graph.nodes[node_id]["state"] != NodeState.WAITING:
+                    raise GraphMutationError(f"can only resume waiting task {node_id}")
 
             for task in patch.add:
-                self.db.execute("INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, NULL)",
-                                (run_id, task.id, task.skill, json.dumps(task.input), json.dumps(task.metadata), NodeState.PENDING))
-            for parent, child in patch.connect:
-                self.db.execute("INSERT OR IGNORE INTO edges VALUES (?, ?, ?)", (run_id, parent, child))
-            # Detect cycles after adding all edges, while the transaction can still roll back.
-            if self._has_cycle(run_id):
+                graph.add_node(task.id, skill=task.skill, input=task.input, metadata=task.metadata,
+                               state=NodeState.PENDING, result=None)
+            graph.add_edges_from(patch.connect)
+            if not nx.is_directed_acyclic_graph(graph):
                 raise GraphMutationError("patch would create a dependency cycle")
-            for nid in patch.cancel:
-                self.db.execute("UPDATE nodes SET state=? WHERE run_id=? AND id=?", (NodeState.CANCELLED, run_id, nid))
-                self._event(run_id, "task_cancelled", nid,
-                            {"reason": patch.reason, "was_running": existing.nodes[nid]["state"] == NodeState.RUNNING})
-            for nid in patch.wait:
-                self.db.execute("UPDATE nodes SET state=? WHERE run_id=? AND id=?", (NodeState.WAITING, run_id, nid))
-            for nid in patch.resume:
-                self.db.execute("UPDATE nodes SET state=? WHERE run_id=? AND id=?", (NodeState.PENDING, run_id, nid))
+            for node_id in patch.cancel:
+                was_running = graph.nodes[node_id]["state"] == NodeState.RUNNING
+                graph.nodes[node_id]["state"] = NodeState.CANCELLED
+                self._event(state, "task_cancelled", node_id,
+                            {"reason": patch.reason, "was_running": was_running})
+            for node_id in patch.wait:
+                graph.nodes[node_id]["state"] = NodeState.WAITING
+            for node_id in patch.resume:
+                graph.nodes[node_id]["state"] = NodeState.PENDING
             if patch.finish:
-                # A planner may conclude that an answer is final while a
-                # speculative sibling is still running. Finish is therefore
-                # a durable cancellation boundary, not permission to leave a
-                # coroutine recorded as running after the executor returns.
-                leftovers = self.db.execute(
-                    "SELECT id, state FROM nodes WHERE run_id=? AND state IN (?, ?, ?)",
-                    (run_id, NodeState.PENDING, NodeState.WAITING, NodeState.RUNNING),
-                ).fetchall()
-                for leftover in leftovers:
-                    self.db.execute("UPDATE nodes SET state=? WHERE run_id=? AND id=?",
-                                    (NodeState.CANCELLED, run_id, leftover["id"]))
-                    self._event(run_id, "task_cancelled", leftover["id"],
-                                {"reason": "graph finished", "was_running": leftover["state"] == NodeState.RUNNING})
-                self.db.execute("UPDATE runs SET finished=1 WHERE id=?", (run_id,))
-            patch_payload = {"trigger_event": trigger_event, "reason": patch.reason,
-                        "add": add_ids, "connect": list(patch.connect), "cancel": list(patch.cancel),
-                        "wait": list(patch.wait), "resume": list(patch.resume), "finish": patch.finish,
-                        **patch.metadata}
-            self._event(run_id, "graph_patched", None, patch_payload)
-            self.db.execute("INSERT INTO patches(run_id, trigger_event, patch_json) VALUES (?, ?, ?)",
-                            (run_id, trigger_event, json.dumps(patch_payload)))
+                for node_id, node in graph.nodes(data=True):
+                    if node["state"] in {NodeState.PENDING, NodeState.WAITING, NodeState.RUNNING}:
+                        was_running = node["state"] == NodeState.RUNNING
+                        node["state"] = NodeState.CANCELLED
+                        self._event(state, "task_cancelled", str(node_id),
+                                    {"reason": "graph finished", "was_running": was_running})
+                graph.graph["finished"] = True
+            patch_payload = {"trigger_event": trigger_event, "reason": patch.reason, "add": add_ids,
+                             "connect": list(patch.connect), "cancel": list(patch.cancel),
+                             "wait": list(patch.wait), "resume": list(patch.resume),
+                             "finish": patch.finish, **patch.metadata}
+            self._event(state, "graph_patched", None, patch_payload)
+            state["applied_triggers"][trigger] = patch_payload
+            self._save(state)
             return True
 
     def is_finished(self, run_id: str) -> bool:
-        row = self.db.execute("SELECT finished FROM runs WHERE id=?", (run_id,)).fetchone()
-        return bool(row and row["finished"])
+        with self._lock:
+            return bool(self._load(run_id)["graph"].graph.get("finished"))
 
     def node_state(self, run_id: str, node_id: str) -> str:
-        row = self.db.execute("SELECT state FROM nodes WHERE run_id=? AND id=?", (run_id, node_id)).fetchone()
-        if not row:
-            raise KeyError(f"unknown task {node_id!r} in run {run_id!r}")
-        return row["state"]
+        with self._lock:
+            graph = self._load(run_id)["graph"]
+            if node_id not in graph:
+                raise KeyError(f"unknown task {node_id!r} in run {run_id!r}")
+            return str(graph.nodes[node_id]["state"])
 
     def events(self, run_id: str) -> list[Event]:
-        return [self._event_from_row(r) for r in self.db.execute("SELECT * FROM events WHERE run_id=? ORDER BY sequence", (run_id,))]
+        with self._lock:
+            return [self._as_event(raw) for raw in self._load(run_id)["events"]]
 
-    def record_external_event(self, run_id: str, kind: str, node_id: str, payload: dict[str, Any]) -> Event:
-        """Journal a trusted transport event before it mutates a waiting graph."""
-        with self.db:
-            if not self.db.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone():
-                raise KeyError(run_id)
-            return self._event(run_id, kind, node_id, payload)
-
-    def _event(self, run_id: str, kind: str, node_id: str | None, payload: dict[str, Any]) -> Event:
-        cursor = self.db.execute("INSERT INTO events(run_id, kind, node_id, payload_json) VALUES (?, ?, ?, ?)",
-                                 (run_id, kind, node_id, json.dumps(payload)))
-        return Event(cursor.lastrowid, kind, node_id, payload)
-
-    @staticmethod
-    def _event_from_row(row: sqlite3.Row) -> Event:
-        return Event(row["sequence"], row["kind"], row["node_id"], json.loads(row["payload_json"]))
-
-    def _has_cycle(self, run_id: str) -> bool:
-        edges: dict[str, list[str]] = {}
-        for row in self.db.execute("SELECT parent_id, child_id FROM edges WHERE run_id=?", (run_id,)):
-            edges.setdefault(row["parent_id"], []).append(row["child_id"])
-        seen, active = set(), set()
-        def visit(nid: str) -> bool:
-            if nid in active: return True
-            if nid in seen: return False
-            seen.add(nid); active.add(nid)
-            cycle = any(visit(child) for child in edges.get(nid, ()))
-            active.remove(nid)
-            return cycle
-        return any(visit(nid) for nid in edges)
+    def record_external_event(self, run_id: str, kind: str, node_id: str,
+                              payload: dict[str, Any]) -> Event:
+        with self._lock:
+            state = self._load(run_id)
+            event = self._event(state, kind, node_id, payload)
+            self._save(state)
+            return event
