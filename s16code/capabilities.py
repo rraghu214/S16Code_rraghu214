@@ -80,6 +80,9 @@ class CapabilityRegistry:
     def manifest(self) -> list[dict[str, Any]]:
         return [item.manifest() for item in self._items.values()]
 
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._items)
+
     def terminal_skills(self, respond_as: str) -> set[str]:
         return {item.name for item in self._items.values() if respond_as in item.terminal_for}
 
@@ -206,6 +209,15 @@ def default_registry() -> CapabilityRegistry:
         Capability("create_calendar_events", "Create local iCalendar artifacts for explicit ISO dates requested by the user.",
                    {"title": string("Human-readable event title.", maximum=300),
                     "dates": Argument("array", "ISO-8601 dates (YYYY-MM-DD).", minimum=1, maximum=20, item_kind="string")},
+                   side_effect=True),
+        Capability("list_channels", "Ask GLC for the currently installed channel adapters and their connection state. The list is discovered at runtime, never encoded in the planner.",
+                   {}),
+        Capability("send_channel_message", "Send one text message through an installed GLC channel. Use only when the request or an authorised subscription explicitly identifies the channel and recipient.",
+                   {"channel": string("Channel name returned by list_channels or supplied by authorised context.", maximum=100),
+                    "recipient_id": string("Provider-native recipient, conversation, address, or account identifier.", maximum=2_000),
+                    "text": string("Message to send.", maximum=20_000),
+                    "thread_id": string("Existing provider thread identifier when replying in context.", required=False, maximum=2_000),
+                    "voice_audio_ref": string("Existing audio artifact reference for a voice-capable channel.", required=False, maximum=4_000)},
                    side_effect=True),
         Capability("a2a_delegate", "Discover a remote A2A agent, verify its Agent Card under local trust policy, and delegate one task.",
                    {"agent_url": string("Base URL of the remote agent.", maximum=4_000),

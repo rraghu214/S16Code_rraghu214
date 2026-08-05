@@ -1,4 +1,4 @@
-"""The only S16Code -> gateway seam: ordinary authenticated HTTP.
+"""The S16Code -> gateway seam: ordinary authenticated HTTP.
 
 S16Code holds no provider credential. It asks the gateway for a completion; the
 gateway owns keys, routing, quotas and provider quirks. Session 15 adds one thing
@@ -116,6 +116,52 @@ class GatewayClient:
         response = await self._client.get(f"{self.base_url}/healthz", timeout=3)
         response.raise_for_status()
         return response.json()
+
+    def _channel_headers(self) -> dict[str, str]:
+        token = os.getenv("S16_CHANNEL_BRIDGE_TOKEN", "").strip()
+        return {"Authorization": f"Bearer {token}"} if token else {}
+
+    async def channels(self) -> list[dict[str, Any]]:
+        """Discover the gateway catalogue; S16 carries no channel-name list."""
+        response = await self._client.get(f"{self.base_url}/v1/channels")
+        response.raise_for_status()
+        body = response.json()
+        channels = body.get("channels", [])
+        if not isinstance(channels, list):
+            raise RuntimeError("gateway returned an invalid channel catalogue")
+        return channels
+
+    async def send_channel(
+        self,
+        *,
+        channel: str,
+        recipient_id: str,
+        text: str,
+        thread_id: str | None = None,
+        voice_audio_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Send through one dynamically discovered GLC adapter."""
+        payload = {
+            "channel": channel,
+            "channel_user_id": recipient_id,
+            "text": text,
+            "thread_id": thread_id,
+            "voice_audio_ref": voice_audio_ref,
+            "attachments": [],
+        }
+        response = await self._client.post(
+            f"{self.base_url}/v1/channels/{channel}/send",
+            json=payload,
+            headers=self._channel_headers(),
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"gateway channel send returned {response.status_code}: {response.text[:500]}"
+            )
+        body = response.json()
+        if not isinstance(body, dict):
+            raise RuntimeError("gateway returned an invalid channel receipt")
+        return body
 
     async def close(self) -> None:
         if self._owns_client:

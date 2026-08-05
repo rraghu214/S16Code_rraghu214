@@ -414,6 +414,25 @@ class AgentRuntime:
                 artifacts.append(path.as_uri())
             return {"artifacts": artifacts, "title": title, "dates": [item.isoformat() for item in dates]}
 
+        async def list_channels(task: TaskSpec) -> dict[str, Any]:  # noqa: ARG001
+            if transport is None or not hasattr(transport, "channels"):
+                raise RuntimeError("the configured gateway transport does not expose channels")
+            channels = await transport.channels()
+            return {"channels": channels, "count": len(channels)}
+
+        async def send_channel_message(task: TaskSpec) -> dict[str, Any]:
+            if transport is None or not hasattr(transport, "send_channel"):
+                raise RuntimeError("the configured gateway transport cannot send channel messages")
+            receipt = await transport.send_channel(
+                channel=task.input["channel"],
+                recipient_id=task.input["recipient_id"],
+                text=task.input["text"],
+                thread_id=task.input.get("thread_id"),
+                voice_audio_ref=task.input.get("voice_audio_ref"),
+            )
+            return {"channel": task.input["channel"], "recipient_id": task.input["recipient_id"],
+                    "receipt": receipt}
+
         async def a2a_delegate(task: TaskSpec) -> dict[str, Any]:
             trusted_dir = os.getenv("S16_A2A_TRUSTED_KEYS_DIR")
             allow_unsigned = os.getenv("S16_A2A_ALLOW_UNSIGNED", "0").lower() in {"1", "true", "yes"}
@@ -919,6 +938,7 @@ class AgentRuntime:
             "current_datetime": run_current_datetime,
             "date_shift": run_date_shift,
             "create_calendar_events": create_calendar_events, "a2a_delegate": a2a_delegate,
+            "list_channels": list_channels, "send_channel_message": send_channel_message,
             "launch_job": launch_job,
             "request_approval": request_approval,
             "answer_with_evidence": answer, "researcher": run_researcher, "retriever": run_retriever,

@@ -2,7 +2,8 @@
 
 S16Code takes S15's durable graph, memory, A2A, UI, budget controller and
 telemetry as its foundation, then replaces the task-shaped planner with a
-general capability-driven agent loop.
+general capability-driven agent loop. `glc_v5` connects that loop to every
+enabled gateway channel through one shared envelope.
 
 The planner does **not** build the whole DAG up front. It proposes only the next
 runnable frontier, the runtime launches independent nodes together, and every
@@ -59,12 +60,12 @@ finds no usable URL—or no page can be read—the researcher returns
 
 The graph journal remains the source for replay, UI events and telemetry. All
 gateway model calls—including planning and evidence review—pass through S15's
-metered call seam. `glc_v4` remains a separate service and owns provider keys;
+metered call seam. `glc_v5` remains a separate service and owns provider keys;
 S16Code contains none.
 
 ## Run locally
 
-Start `glc_v4` on port `8111`, then:
+Start `glc_v5` on port `8111`, then:
 
 ```bash
 uv sync
@@ -81,10 +82,53 @@ documented in `.env.example`; most importantly:
 GLC_BASE_URL=http://127.0.0.1:8111
 S16_GATEWAY_PROVIDER=gemini
 S16_SANDBOX_ROOT=/absolute/path/the-agent-may-read
+S16_CHANNEL_BRIDGE_TOKEN=the-same-private-value-used-by-glc-v5
 ```
 
-Do not put provider keys in S16Code. `glc_v4` can rotate among its configured
+Do not put provider keys in S16Code. `glc_v5` can rotate among its configured
 Gemini keys behind the one logical `gemini` provider.
+
+## Channel operation and proof
+
+GLC converts provider-specific payloads; S16 sees only the canonical envelope.
+An inbound message creates a real live-graph run, and its terminal result is
+returned on the originating channel and thread. A same-thread reply can satisfy
+a waiting human-approval node. An external job callback can resume a sleeping
+run and proactively send its completed answer through GLC.
+
+The channel list is discovered from GLC at runtime:
+
+```bash
+curl -s http://127.0.0.1:8111/v1/channels | jq
+```
+
+The 20-prompt stress catalogue spans every shipped channel and checks observable
+capability families, parallel frontiers, and wait/resume events—not prescribed
+node IDs or a prompt-specific graph:
+
+```bash
+# Start this proof S16 with only local fixture mutations authorised:
+S16_CHANNEL_ALLOWED_SIDE_EFFECTS=remember_explicit_fact,write_file,index_file,create_calendar_events,request_approval \
+  uv run s16code serve
+
+# In another shell, use the installation token printed from glc_v5:
+GLC_INSTALL_TOKEN=<glc-v5-install-token> \
+  uv run python proofs/channel_stress.py \
+  --glc http://127.0.0.1:8111 --s16 http://127.0.0.1:8113
+```
+
+Run the proof with channel authority limited to the local fixture capabilities
+shown in `proofs/channel_stress.py`. It injects canonical envelopes locally and
+fails any scenario that invokes `send_channel_message` or `launch_job`, so it
+cannot silently count an external delivery as proof.
+Native provider payload conversion remains the responsibility of each GLC
+adapter's tests. Its JSON report contains each original prompt, actual graph
+capabilities, reply, event count, parallel/wait/resume evidence, and result.
+
+GLC recomputes sender trust from pairing state before the message reaches S16.
+Only a gateway-verified installation owner receives the side-effect authority
+listed in `S16_CHANNEL_ALLOWED_SIDE_EFFECTS`; other allowed senders remain
+read-only.
 
 Example:
 
@@ -129,6 +173,6 @@ existing-evidence dependencies, bounded graph/frontier size, deduplication,
 metered provider calls, budget admission, durable outcomes, and no research
 synthesis without readable sources.
 
-`glc_v4` was not changed for S16. Therefore there is no `s16/glc_v5`; create it
-only if a later S16 requirement genuinely changes gateway behavior rather than
-the agent client.
+Provider adapters vary in how much live external delivery they implement. The
+connection proof establishes that every registered adapter reaches the S16 seam;
+it is not a claim that unconfigured Gmail, Twilio, or Slack accounts can send.

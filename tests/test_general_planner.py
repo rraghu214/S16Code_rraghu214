@@ -98,6 +98,152 @@ async def test_planner_may_expand_from_one_outcome_while_a_sibling_is_running():
 
 
 @pytest.mark.asyncio
+async def test_planner_can_add_a_join_that_waits_for_a_running_sibling():
+    nodes = {
+        "date": {"id": "date", "skill": "current_datetime", "input": {}, "metadata": {},
+                 "state": "succeeded", "result": {"date": "2026-08-05"}},
+        "research": {"id": "research", "skill": "researcher", "input": {}, "metadata": {},
+                     "state": "running", "result": None},
+    }
+    reply = Replies({"add": [{"id": "join", "capability": "distiller",
+        "arguments": {"query": "combine date and research"},
+        "depends_on": ["date", "research"]}], "cancel": [], "finish": False,
+        "reason": "join when both outcomes exist"})
+    planner = GeneralAgentPlanner(reply, default_registry(), goal="Build a dated research plan",
+                                  review_terminal=False)
+    patch = await planner.plan(snapshot(nodes), Event(5, "task_succeeded", "date", {"date": "2026-08-05"}))
+    assert [task.id for task in patch.add] == ["join"]
+    assert patch.connect == (("date", "join"), ("research", "join"))
+
+
+def test_planner_manifest_hides_side_effects_the_run_cannot_execute():
+    planner = GeneralAgentPlanner(Replies(), default_registry(), goal="answer safely",
+                                  review_terminal=False,
+                                  allowed_side_effects={"request_approval"})
+    payload = json.loads(planner._prompt(snapshot(), Event(1, "run_started", None, {})))
+    names = {item["name"] for item in payload["capabilities"]}
+    assert "request_approval" in names
+    assert "send_channel_message" not in names
+    assert "write_file" not in names
+    assert "answer_with_evidence" in names
+
+
+@pytest.mark.asyncio
+async def test_duplicate_terminal_proposal_waits_for_the_terminal_already_running():
+    nodes = {
+        "distill": {"id": "distill", "skill": "distiller", "input": {}, "metadata": {},
+                    "state": "succeeded", "result": {"text": "ready"}},
+        "answer": {"id": "answer", "skill": "answer_with_evidence", "input": {"query": "goal"},
+                   "metadata": {}, "state": "running", "result": None},
+    }
+    reply = Replies({"add": [{"id": "answer_again", "capability": "answer_with_evidence",
+        "arguments": {"query": "a differently worded goal"}, "depends_on": ["distill"]}],
+        "cancel": [], "finish": False, "reason": "answer"})
+    planner = GeneralAgentPlanner(reply, default_registry(), goal="goal", review_terminal=False)
+    patch = await planner.plan(snapshot(nodes), Event(8, "task_succeeded", "distill", {"text": "ready"}))
+    assert not patch.add and not patch.finish
+    assert planner.history[-1]["accepted"] is True
+
+
+@pytest.mark.asyncio
+async def test_invalid_partial_replan_never_cancels_useful_work_still_running():
+    nodes = {"research": {"id": "research", "skill": "researcher", "input": {}, "metadata": {},
+                          "state": "running", "result": None}}
+    invalid = {"add": [{"id": "bad", "capability": "invented_tool", "arguments": {},
+                        "depends_on": []}], "cancel": [], "finish": False, "reason": "bad"}
+    planner = GeneralAgentPlanner(Replies(invalid, invalid), default_registry(), goal="research",
+                                  review_terminal=False, repair_attempts=1)
+    patch = await planner.plan(snapshot(nodes), Event(4, "task_succeeded", "other", {}))
+    assert not patch.finish and not patch.cancel
+    assert "failed validation" in patch.reason
+
+
+@pytest.mark.asyncio
+async def test_task_keyed_provider_json_is_normalized_by_capability_schema():
+    reply = Replies({
+        "research_gmail": {"capability": "researcher",
+                           "arguments": {"query": "official Gmail watch recovery"},
+                           "depends_on": []},
+        "research_github": {"capability": "researcher",
+                            "arguments": {"query": "official GitHub webhook redelivery"},
+                            "depends_on": []},
+        "reason": "independent research",
+    })
+    planner = GeneralAgentPlanner(reply, default_registry(), goal="Research two event sources",
+                                  review_terminal=False)
+    patch = await planner.plan(snapshot(), Event(1, "run_started", None, {}))
+    assert [(task.id, task.skill) for task in patch.add] == [
+        ("research_github", "researcher"), ("research_gmail", "researcher")]
+
+
+@pytest.mark.asyncio
+async def test_capability_prefixed_task_key_is_normalized_without_a_channel_table():
+    reply = Replies({"send_channel_message_3": {
+        "channel": "future_adapter", "recipient_id": "destination", "text": "done",
+    }})
+    planner = GeneralAgentPlanner(reply, default_registry(), goal="Send through a discovered adapter",
+                                  review_terminal=False,
+                                  allowed_side_effects={"send_channel_message"})
+    patch = await planner.plan(snapshot(), Event(1, "run_started", None, {}))
+    assert [(task.id, task.skill, task.input["channel"]) for task in patch.add] == [
+        ("send_channel_message_3", "send_channel_message", "future_adapter")]
+
+
+@pytest.mark.asyncio
+async def test_one_patch_can_cancel_and_replace_equivalent_active_work():
+    nodes = {"old": {"id": "old", "skill": "fetch_url",
+                     "input": {"url": "https://status.example"}, "metadata": {},
+                     "state": "pending", "result": None}}
+    reply = Replies({"add": [{"id": "retry", "capability": "fetch_url",
+        "arguments": {"url": "https://status.example"}, "depends_on": []}],
+        "cancel": ["old"], "finish": False, "reason": "replace a genuinely stuck request"})
+    planner = GeneralAgentPlanner(reply, default_registry(), goal="Read status", review_terminal=False)
+    patch = await planner.plan(snapshot(nodes), Event(4, "task_succeeded", "other", {}))
+    assert [task.id for task in patch.add] == ["retry"]
+    assert patch.cancel == ("old",)
+
+
+@pytest.mark.asyncio
+async def test_planner_cannot_guess_that_an_executing_worker_is_stuck():
+    nodes = {
+        "answer": {"id": "answer", "skill": "answer_with_evidence", "input": {"query": "goal"},
+                   "metadata": {}, "state": "running", "result": None},
+        "distill": {"id": "distill", "skill": "distiller", "input": {"query": "goal"},
+                    "metadata": {}, "state": "succeeded", "result": {"text": "ready"}},
+    }
+    reply = Replies(
+        {"add": [], "cancel": ["answer"], "finish": False,
+         "reason": "I think the answer is stuck"},
+        {"add": [], "cancel": [], "finish": False,
+         "reason": "wait for the executing answer; runtime timeout owns failure"},
+    )
+    planner = GeneralAgentPlanner(reply, default_registry(), goal="goal", review_terminal=False)
+    patch = await planner.plan(snapshot(nodes), Event(7, "task_succeeded", "distill", {}))
+    assert not patch.cancel and not patch.finish
+    assert planner.history[0]["accepted"] is False
+
+
+@pytest.mark.asyncio
+async def test_unexplained_cancellation_cannot_destroy_running_siblings():
+    nodes = {
+        "aws": {"id": "aws", "skill": "web_search", "input": {"query": "AWS status"},
+                "metadata": {}, "state": "running", "result": None},
+        "gcp": {"id": "gcp", "skill": "web_search", "input": {"query": "GCP status"},
+                "metadata": {}, "state": "succeeded", "result": {"hits": []}},
+    }
+    reply = Replies(
+        {"add": [], "cancel": ["aws"], "finish": False},
+        {"add": [], "cancel": [], "finish": False,
+         "reason": "wait for the independent AWS outcome"},
+    )
+    planner = GeneralAgentPlanner(reply, default_registry(), goal="Compare status pages",
+                                  review_terminal=False)
+    patch = await planner.plan(snapshot(nodes), Event(6, "task_succeeded", "gcp", {"hits": []}))
+    assert not patch.cancel and not patch.finish
+    assert planner.history[0]["accepted"] is False
+
+
+@pytest.mark.asyncio
 async def test_reproposing_identical_active_work_is_normalized_to_wait():
     nodes = {"research": {"id": "research", "skill": "researcher",
                           "input": {"query": "current evidence", "max_results": 3},
