@@ -82,3 +82,27 @@ def test_read_only_observability_is_available_to_an_operator(app_client) -> None
     markdown = app_client.get("/v1/agent/report", params={"fmt": "markdown"})
     assert "Overnight report" in markdown.text
     assert "NOT ALIVE" in markdown.text
+
+
+def test_the_operator_console_is_served_and_is_read_only(app_client) -> None:
+    """§9 promises an operations page. It has to exist, and it has to be inert.
+
+    The console reads the durable history and nothing else. A page that could
+    create a subscription would be the exact hole the control plane exists to
+    close, so it ships with no write path at all.
+    """
+    page = app_client.get("/console")
+    assert page.status_code == 200
+    body = page.text
+    assert "autonomy console" in body.lower()
+
+    # It reads the endpoints an operator needs...
+    for endpoint in ("/v1/agent/liveness", "/v1/agent/refusals",
+                     "/v1/agent/report", "/v1/agent/events/stream?after="):
+        assert endpoint in body, f"console never calls {endpoint}"
+
+    # ...and never writes. No method:POST/PUT/DELETE anywhere in the page.
+    lowered = body.lower()
+    for verb in ('method: "post"', "method:'post'", 'method: "put"',
+                 'method: "delete"', "_method: post"):
+        assert verb not in lowered, f"console contains a write call: {verb}"

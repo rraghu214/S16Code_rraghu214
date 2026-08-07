@@ -214,6 +214,26 @@ async def client(run_id: str):
     return _CLIENT.read_text().replace("__RUN_ID__", run_id)
 
 
+@router.get("/console", response_class=HTMLResponse)
+@router.get("/console/", response_class=HTMLResponse)
+async def autonomy_console():
+    """The operator page for a system nobody is watching.
+
+    Session 9 of the lesson promises "a browser or operations page that
+    reconnects with after=41". This is it: a projection of the durable event
+    history, with the liveness beat as its loudest element, because a quiet
+    console and a dead watcher must not render the same.
+
+    Read-only on purpose. Every write path needs the control token and has no
+    button here; an operator page that could create authority would be the very
+    hole the control plane exists to close.
+    """
+    path = Path(__file__).parent / "client" / "console.html"
+    if not path.exists():
+        raise HTTPException(500, "autonomy console missing")
+    return path.read_text()
+
+
 @router.get("/app", response_class=HTMLResponse)
 @router.get("/app/", response_class=HTMLResponse)
 async def app_viewer():
