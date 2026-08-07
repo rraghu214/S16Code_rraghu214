@@ -17,6 +17,11 @@ class EventEnvelope(BaseModel):
     observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     data: dict[str, Any] = Field(default_factory=dict)
     traceparent: str | None = Field(default=None, max_length=500)
+    # Who caused this fact. An agent that acts in a system it also watches will
+    # see its own actions come back as events; without an actor it cannot tell
+    # them apart from anybody else's, and one reply to a watched mailbox becomes
+    # a loop that only a spend ceiling stops, after the fact.
+    actor: str | None = Field(default=None, max_length=500)
 
 
 class Subscription(BaseModel):
@@ -31,6 +36,17 @@ class Subscription(BaseModel):
     user_id: str | None = Field(default=None, max_length=200)
     agent_id: str | None = Field(default="s16-autonomous", max_length=200)
     allowed_side_effects: list[str] = Field(default_factory=list, max_length=50)
+    # Per-run ceiling, inherited from Session 15's hard controller.
     budget: float | None = Field(default=None, gt=0)
+    # Per-window ceilings. A per-run ceiling does not bound an agent that starts
+    # its own runs: it simply starts more of them. These bound the window.
+    daily_budget: float | None = Field(default=None, gt=0)
+    max_runs_per_day: int | None = Field(default=None, gt=0)
+    # Triage costs money on every matching event, whether or not work follows.
+    # This is the ceiling on being awake, as distinct from the ceiling on doing.
+    daily_triage_budget: float | None = Field(default=None, gt=0)
+    # Actors whose events this subscription refuses, so the agent does not
+    # answer itself. The runtime's own identity is always included.
+    ignore_actors: list[str] = Field(default_factory=list, max_length=50)
     enabled: bool = True
 

@@ -48,6 +48,43 @@ pages. Search snippets and pages are untrusted evidence. Crucially, if search
 finds no usable URL—or no page can be read—the researcher returns
 `insufficient: true` and does **not** ask a model to synthesize facts.
 
+## Unattended operation
+
+Everything above assumes somebody asked. The autonomy layer is what the harness
+adds for the case where nobody did, and where nobody is watching either.
+
+- `s16code/events/` normalises cron ticks, webhooks, Gmail Pub/Sub, channel
+  messages and job callbacks into one `EventEnvelope`, deduplicates on
+  `(source, id)`, and records a relevance decision for every matching
+  subscription — including the decisions that were "no".
+- **Events are facts; subscriptions are intent and authority.** An event can
+  never write the instruction, the allowed side effects or the budget that
+  govern it. That is why writing a subscription is a control-plane action.
+- `s16code/auth.py` gates every write path and **fails closed**. With no
+  `S16_CONTROL_TOKEN` configured, `PUT /v1/agent/subscriptions/{id}`,
+  `POST /v1/agent/events`, `POST /v1/agent/runs` and the resume route all answer
+  `503` rather than serving anonymously. Job callbacks hold a separate token.
+- `s16code/events/governor.py` bounds operation over a **window**, not a
+  request. A per-run ceiling does not bound an agent that starts its own runs;
+  `daily_budget`, `max_runs_per_day` and `daily_triage_budget` do. It also
+  rate-limits per source and refuses events this agent itself caused, so a reply
+  into a watched mailbox cannot become a loop.
+- Every refusal is recorded. A control that prevents work leaves no other trace,
+  and without the record a well-defended night and an idle night look identical.
+- `s16code/events/lease.py` stops a periodic trigger overlapping itself, and
+  reports a skip rather than silently doing nothing.
+- `s16code/events/report.py` publishes a heartbeat (`GET /v1/agent/liveness`,
+  `503` once stale) and the human-readable account of a period nobody watched
+  (`GET /v1/agent/report`), which costs **watching** separately from **doing**.
+
+```bash
+uv run python proofs/p_naive_vs_bounded.py    # naive vs gated vs bounded, same stream
+uv run python proofs/p_autonomy_bounds.py     # seven properties of the ceilings
+```
+
+Both take their event stream and every ceiling as arguments, so they run against
+work they have never seen, and both exit non-zero on failure.
+
 ## Inherited production boundaries
 
 - `s16code/core/live_graph/`: event-sourced executor, patches and replay
@@ -83,7 +120,13 @@ GLC_BASE_URL=http://127.0.0.1:8111
 S16_GATEWAY_PROVIDER=gemini
 S16_SANDBOX_ROOT=/absolute/path/the-agent-may-read
 S16_CHANNEL_BRIDGE_TOKEN=the-same-private-value-used-by-glc-v5
+S16_CONTROL_TOKEN=required-or-every-write-path-answers-503
+S16_COMPLETION_TOKEN=a-different-token-for-job-callbacks
 ```
+
+The control plane has no unauthenticated mode. `if expected and not
+compare_digest(...)` reads like a check and behaves like an open door on a fresh
+checkout, so these gates refuse to serve instead.
 
 Do not put provider keys in S16Code. `glc_v5` can rotate among its configured
 Gemini keys behind the one logical `gemini` provider.

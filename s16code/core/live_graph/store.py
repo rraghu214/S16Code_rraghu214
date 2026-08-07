@@ -44,6 +44,47 @@ class GraphStore:
     def _path(self, run_id: str) -> Path:
         return self.path / f"{hashlib.sha256(run_id.encode()).hexdigest()}.json"
 
+    # ---- waiting-handle index -------------------------------------------
+    # A parked node is resumed by a callback that knows only its handle. Finding
+    # the owning run by reading every checkpoint on disk is O(all runs ever) per
+    # callback, which is precisely the cost curve an agent meant to run
+    # unattended for hours must not have. The index is a rebuildable derivative
+    # of the checkpoints: if it is lost or stale, the scan below still finds the
+    # run, and the index is repaired from what it finds.
+
+    @property
+    def _index_path(self) -> Path:
+        return self.path / "waiting-handles.json"
+
+    def _read_index(self) -> dict[str, str]:
+        try:
+            value = json.loads(self._index_path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _write_index(self, index: dict[str, str]) -> None:
+        fd, temporary = tempfile.mkstemp(prefix=".handles-", suffix=".tmp", dir=self.path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(index, stream, sort_keys=True, separators=(",", ":"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self._index_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _index_handle(self, handle: str, event_type: str, run_id: str) -> None:
+        index = self._read_index()
+        index[f"{handle}|{event_type}"] = run_id
+        self._write_index(index)
+
+    def _forget_handle(self, handle: str, event_type: str) -> None:
+        index = self._read_index()
+        if index.pop(f"{handle}|{event_type}", None) is not None:
+            self._write_index(index)
+
     @staticmethod
     def _new(run_id: str, context: dict[str, Any]) -> dict[str, Any]:
         graph = nx.DiGraph()
@@ -178,22 +219,17 @@ class GraphStore:
             node["state"], node["wait"] = NodeState.WAITING, wait
             event = self._event(state, "task_waiting", node_id, wait)
             self._save(state)
+            # Record where this handle lives while we know it, so the callback
+            # that arrives hours later does not have to read every run on disk.
+            if wait.get("handle") and wait.get("event_type"):
+                self._index_handle(str(wait["handle"]), str(wait["event_type"]), run_id)
             return event
 
     def complete_waiting(self, handle: str, event_type: str, payload: dict[str, Any],
                          *, success: bool = True) -> tuple[str, str, Event] | None:
         """Complete one parked task; a duplicate delivery becomes a no-op."""
         with self._lock:
-            matches: list[tuple[str, dict[str, Any], str]] = []
-            for path in self.path.glob("*.json"):
-                raw = json.loads(path.read_text(encoding="utf-8"))
-                graph = json_graph.node_link_graph(raw["graph"], edges="edges")
-                for node_id, node in graph.nodes(data=True):
-                    wait = node.get("wait") or {}
-                    if (node.get("state") == NodeState.WAITING and wait.get("handle") == handle
-                            and wait.get("event_type") == event_type):
-                        raw["graph"] = graph
-                        matches.append((str(graph.graph["run_id"]), raw, str(node_id)))
+            matches = self._find_waiting(handle, event_type)
             if not matches:
                 return None
             if len(matches) != 1:
@@ -207,7 +243,44 @@ class GraphStore:
                         {"handle": handle, "event_type": event_type})
             event = self._event(state, "task_succeeded" if success else "task_failed", node_id, payload)
             self._save(state)
+            # Consumed exactly once: the handle is retired so a replayed
+            # delivery finds nothing and becomes a recorded no-op.
+            self._forget_handle(handle, event_type)
             return run_id, node_id, event
+
+    def _find_waiting(self, handle: str, event_type: str) -> list[tuple[str, dict[str, Any], str]]:
+        """Resolve a handle through the index, falling back to a full scan."""
+
+        def scan(paths) -> list[tuple[str, dict[str, Any], str]]:
+            found: list[tuple[str, dict[str, Any], str]] = []
+            for path in paths:
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if raw.get("format") != self.FORMAT:
+                    continue
+                graph = json_graph.node_link_graph(raw["graph"], edges="edges")
+                for node_id, node in graph.nodes(data=True):
+                    wait = node.get("wait") or {}
+                    if (node.get("state") == NodeState.WAITING and wait.get("handle") == handle
+                            and wait.get("event_type") == event_type):
+                        raw["graph"] = graph
+                        found.append((str(graph.graph["run_id"]), raw, str(node_id)))
+            return found
+
+        run_id = self._read_index().get(f"{handle}|{event_type}")
+        if run_id:
+            hit = scan([self._path(run_id)])
+            if hit:
+                return hit
+            # A stale index entry is a bug in the index, not evidence of
+            # absence. Fall through to the scan and repair on the way out.
+            self._forget_handle(handle, event_type)
+        found = scan(path for path in self.path.glob("*.json") if path != self._index_path)
+        for owner, _state, _node in found:
+            self._index_handle(handle, event_type, owner)
+        return found
 
     def pending_planner_events(self, run_id: str) -> list[Event]:
         with self._lock:

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 
+import conftest
 import s16code.routes as agent_route
 from s16code.core.live_graph import Deferred, GraphPatch, TaskSpec
 from s16code.core.memory.embeddings import DeterministicEmbedder
@@ -200,10 +201,12 @@ def test_job_callback_resumes_and_pushes_final_answer_to_originating_channel(app
 
     monkeypatch.setattr(agent_route, "gateway_text_llm", fake_gateway)
     app_client.app.state.gateway.send_channel = AsyncMock(return_value={"accepted": True, "id": "sent-1"})
+    # The remote job service holds the completion token, not the control token:
+    # it may finish work it was given without being able to write subscriptions.
     response = app_client.post("/v1/agent/completions", json={
         "handle": "job-77", "event_type": "job.completed", "success": True,
         "payload": {"status": "passed", "url": "https://ci.example/run/77"},
-    })
+    }, headers={"Authorization": f"Bearer {conftest.COMPLETION_TOKEN}"})
     assert response.status_code == 200
     body = response.json()
     assert body["run"]["answer"] == "The remote build completed successfully."

@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
 
-from s16code.capabilities import CapabilityError, CapabilityRegistry
+from s16code.capabilities import GAP_FIELDS, CapabilityError, CapabilityRegistry
 from s16code.core.live_graph import Event, GraphPatch, GraphSnapshot, TaskSpec
 
 TextLLM = Callable[[str, str], Awaitable[dict[str, Any]]]
@@ -394,12 +394,17 @@ class GeneralAgentPlanner:
         completed = [{"id": node_id, "capability": node["skill"], "arguments": node["input"],
                       "outcome": _clip(node.get("result"))}
                      for node_id, node in graph.nodes.items() if node["state"] == "succeeded"]
-        evidence_attempts = sum(node["skill"] in {"researcher", "web_search", "fetch_url"}
+        # "Which capabilities gather evidence?" is a question about a class of
+        # capability, so it is answered by a declared family rather than by a
+        # literal set of names that goes stale as soon as somebody adds one.
+        evidence_skills = self.registry.family("evidence")
+        evidence_attempts = sum(node["skill"] in evidence_skills
                                 for node in graph.nodes.values() if node["state"] == "succeeded")
+        gap_flag, gap_detail = GAP_FIELDS
         unresolved = [
-            {"id": node_id, "missing": (node.get("result") or {}).get("missing", [])}
+            {"id": node_id, "missing": (node.get("result") or {}).get(gap_detail, [])}
             for node_id, node in graph.nodes.items()
-            if node["state"] == "succeeded" and (node.get("result") or {}).get("insufficient")
+            if node["state"] == "succeeded" and (node.get("result") or {}).get(gap_flag)
         ]
         return json.dumps({"goal": self.goal, "respond_as": self.respond_as,
                            "initial_evidence": _clip(self.initial_evidence),

@@ -8,9 +8,10 @@ import os
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from s16code.auth import require_completion, require_control
 from s16code.core.memory import MemoryKind, MemoryScope, Principal
 from s16code.telemetry import export_run
 
@@ -98,14 +99,18 @@ class ChannelMessageBody(BaseModel):
         return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def _channel_reply(body: ChannelMessageBody, result: dict[str, Any]) -> dict[str, Any]:
+def _channel_reply(body: ChannelMessageBody, result: dict[str, Any],
+                   human_gates: set[str] | None = None) -> dict[str, Any]:
     if result["status"] == "completed":
         text = result.get("answer") or "Completed."
     elif result["status"] == "waiting":
         waiting = [node for node in result.get("graph", {}).get("nodes", {}).values()
                    if node.get("state") == "waiting"]
+        # Which capability parks for a person is a property of the capability,
+        # declared as family "human_gate", not something this route memorises.
+        gates = human_gates or set()
         approvals = [node.get("wait", {}) for node in waiting
-                     if node.get("skill") == "request_approval"]
+                     if node.get("skill") in gates]
         if len(approvals) == 1 and approvals[0].get("question"):
             choices = approvals[0].get("choices") or []
             suffix = f" Choices: {', '.join(choices)}" if choices else ""
@@ -149,8 +154,9 @@ def _waiting_channel_approval(request: Request, body: ChannelMessageBody):
                 snapshot = request.app.state.runtime.graph.snapshot(run_id)
             except KeyError:
                 continue
+            gates = request.app.state.runtime.registry.family("human_gate")
             waits = [node.get("wait") for node in snapshot.nodes.values()
-                     if node.get("state") == "waiting" and node.get("skill") == "request_approval"]
+                     if node.get("state") == "waiting" and node.get("skill") in gates]
             waits = [wait for wait in waits if wait and wait.get("event_type") == "approval.received"]
             if len(waits) == 1:
                 return run_id, waits[0]
@@ -177,7 +183,7 @@ async def _resume_channel_approval(request: Request, body: ChannelMessageBody):
     )
 
 
-@router.post("/runs")
+@router.post("/runs", dependencies=[Depends(require_control)])
 async def run(body: RunBody, request: Request):
     runtime = request.app.state.runtime
     try:
@@ -229,7 +235,7 @@ async def channel_message(
 
     resumed = await _resume_channel_approval(request, body)
     if resumed is not None:
-        reply = _channel_reply(body, resumed)
+        reply = _channel_reply(body, resumed, request.app.state.runtime.registry.family("human_gate"))
         request.app.state.event_store.add_decision(source, event_id, {
             "subscription_id": "channel-approval",
             "relevant": True,
@@ -273,7 +279,7 @@ async def channel_message(
     except (ValueError, RuntimeError) as error:
         raise HTTPException(503, str(error)) from error
 
-    reply = _channel_reply(body, result)
+    reply = _channel_reply(body, result, request.app.state.runtime.registry.family("human_gate"))
     request.app.state.event_store.add_decision(source, event_id, {
         "subscription_id": "channel-direct",
         "relevant": True,
@@ -286,7 +292,7 @@ async def channel_message(
     return reply
 
 
-@router.post("/runs/{run_id}/resume")
+@router.post("/runs/{run_id}/resume", dependencies=[Depends(require_control)])
 async def resume(run_id: str, request: Request):
     runtime = request.app.state.runtime
     try:
@@ -299,14 +305,9 @@ async def resume(run_id: str, request: Request):
         raise HTTPException(503, str(error)) from error
 
 
-@router.post("/completions")
-async def complete_waiting_job(body: CompletionBody, request: Request,
-                               authorization: str | None = Header(default=None)):
+@router.post("/completions", dependencies=[Depends(require_completion)])
+async def complete_waiting_job(body: CompletionBody, request: Request):
     """Consume an idempotent completion and continue from its real outcome."""
-    expected = os.getenv("S16_COMPLETION_TOKEN")
-    supplied = (authorization or "").removeprefix("Bearer ")
-    if expected and not hmac.compare_digest(supplied, expected):
-        raise HTTPException(401, "invalid completion token")
     runtime = request.app.state.runtime
     completion = runtime.graph.complete_waiting(
         body.handle, body.event_type, body.payload, success=body.success
@@ -325,7 +326,7 @@ async def complete_waiting_job(body: CompletionBody, request: Request,
     channel_delivery = None
     origin = _channel_origin(runtime, run_id)
     if origin is not None and result["status"] in {"completed", "failed"}:
-        reply = _channel_reply(origin, result)
+        reply = _channel_reply(origin, result, request.app.state.runtime.registry.family("human_gate"))
         try:
             channel_delivery = await request.app.state.gateway.send_channel(
                 channel=reply["channel"], recipient_id=reply["channel_user_id"],
