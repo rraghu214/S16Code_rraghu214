@@ -153,6 +153,11 @@ gate skipped carries its reason, and work a ceiling prevented is recorded in the
 refusal ledger, because refused work leaves no other trace — nothing spent, nothing
 logged, nothing to find later.
 
+[docs/example-link-catalogue.md](docs/example-link-catalogue.md) shows what the
+rendered catalogue looks like after the assistant has been running across several
+groups for a few months — 31 links kept, 174 refused with a reason each. The
+ratio is the point: the value is in what it left out.
+
 A message is not the unit of work. `POST /v1/agent/channel-messages` extracts
 every URL and derives one `link.shared` event per link (`s16code/routes.py:344`),
 so three links in one message become three independently judged decisions and one

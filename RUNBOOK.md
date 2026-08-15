@@ -159,13 +159,13 @@ pasteable:
 
 ```powershell
 # A realistic hour for the morning report               [the 10-pt item]
-uv run python htmlcov\scripts\simulate_events.py --count 40 --over-minutes 60
+uv run python docs\scripts\simulate_events.py --count 40 --over-minutes 60
 
 # Breach the per-source rate limit -> recorded governor refusals
-uv run python htmlcov\scripts\simulate_events.py --count 200 --over-minutes 0
+uv run python docs\scripts\simulate_events.py --count 200 --over-minutes 0
 
 # One obviously junk link -> a single recorded refusal
-uv run python htmlcov\scripts\simulate_events.py --only junk --count 1
+uv run python docs\scripts\simulate_events.py --only junk --count 1
 ```
 
 ### The report
@@ -343,18 +343,19 @@ catalogue, the report, `tools/put_subscriptions.py`, the bridge terminals.
 
 Two sources of traffic, and they are not interchangeable:
 
-- **`htmlcov/S16-Demo-Content.md`** — real messages you paste into real
-  channels. This is the only thing that can satisfy *"five real conversations,
-  not five configured cards"*. It also carries the ignored links and the
-  ambiguous one that triggers the approval.
-- **`htmlcov/scripts/simulate_events.py`** — volume you cannot paste: the
+- **Your own demo run-sheet** — real messages you paste into real channels. This
+  is the only thing that can satisfy *"five real conversations, not five
+  configured cards"*. It also carries the ignored links and the ambiguous one
+  that triggers the approval. Kept out of the repo: a run-sheet names real
+  mailboxes and chat ids.
+- **`docs/scripts/simulate_events.py`** — volume you cannot paste: the
   report window and the rate-limit refusal.
 
 ### T-60 min — before you press record
 
 ```powershell
 # Clean slate (section 8), then start the unattended window and walk away.
-uv run python htmlcov\scripts\simulate_events.py --count 40 --over-minutes 45
+uv run python docs\scripts\simulate_events.py --count 40 --over-minutes 45
 ```
 Each event posts synchronously and waits for triage, so this takes real time —
 that is the point. Do your channel checks while it runs.
