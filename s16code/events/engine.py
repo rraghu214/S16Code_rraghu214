@@ -83,9 +83,25 @@ class AutonomousEventEngine:
         matching = [item for item in self.store.subscriptions()
                     if self._matches(item, event) and not self._self_caused(item, event)]
 
+        def llm_for(subscription: Subscription) -> TextLLM:
+            """The model this subscription's content is allowed to reach.
+
+            Authority is scoped per subscription, and so is disclosure: a
+            subscription over private channels can pin a local provider so its
+            events never leave the machine, while one over public sources uses a
+            hosted model. It is applied to the relevance gate *and* the run,
+            because a gate that reads the event has already disclosed it.
+            """
+            if not subscription.provider or transport is None:
+                return llm
+            return lambda prompt, system: transport.complete(
+                prompt, system, request={"provider": subscription.provider}
+            )
+
         async def decide(subscription: Subscription) -> dict[str, Any]:
             async with self._slots:
                 now = datetime.now(UTC)
+                scoped_llm = llm_for(subscription)
 
                 # Being awake has its own ceiling. Without it, the gate that
                 # exists to stop a denial-of-wallet attack is itself the
@@ -108,7 +124,7 @@ class AutonomousEventEngine:
                     "\"goal\":string}. If irrelevant, goal must be empty. If relevant, goal must be a concrete "
                     "request that follows the subscription and includes only event facts needed for the work."
                 )
-                reply = await llm(json.dumps({"subscription": subscription.model_dump(mode="json"),
+                reply = await scoped_llm(json.dumps({"subscription": subscription.model_dump(mode="json"),
                                               "event": event.model_dump(mode="json")}), system)
                 triage_cost = _spend_of(reply)
                 self.governor.record(subscription.id, kind="triage", usd=triage_cost, now=now)
@@ -138,7 +154,7 @@ class AutonomousEventEngine:
                         prompt=goal,
                         scope=MemoryScope(subscription.tenant_id, subscription.project_id,
                                           subscription.user_id, subscription.agent_id),
-                        llm=llm, source_uri=f"event://{event.source}/{event.id}",
+                        llm=scoped_llm, source_uri=f"event://{event.source}/{event.id}",
                         source_author=event.source,
                         allowed_side_effects=set(subscription.allowed_side_effects),
                         budget=budget, transport=transport,

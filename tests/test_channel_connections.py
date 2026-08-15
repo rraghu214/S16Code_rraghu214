@@ -152,7 +152,12 @@ def test_a_reply_in_the_same_channel_thread_resumes_a_waiting_approval(app_clien
     first = app_client.post("/v1/agent/channel-messages", headers=headers,
                             json=_channel_message(metadata={"message_id": "approval-1"}))
     assert first.status_code == 200
-    assert first.json()["text"] == "Approval needed: Send the final report? Choices: yes, no"
+    # The run id travels with the question. Answering an approval is the one
+    # moment a person needs to identify the run -- to confirm the work resumed
+    # rather than restarted -- and it should not require looking it up elsewhere.
+    first_text = first.json()["text"]
+    assert first_text.startswith("Approval needed: Send the final report? Choices: yes, no")
+    assert "[Run: " in first_text
 
     second = app_client.post("/v1/agent/channel-messages", headers=headers,
                              json=_channel_message(text="yes", metadata={"message_id": "approval-2"}))

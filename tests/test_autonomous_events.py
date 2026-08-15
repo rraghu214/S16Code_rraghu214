@@ -114,3 +114,77 @@ async def test_outbox_reuses_receipt_and_parks_an_uncertain_crash_window(tmp_pat
     uncertain = await outbox.execute("crash-key", effect)
     assert uncertain.handle == "crash-key" and uncertain.event_type == "outbox.reconcile"
     assert calls == 1
+
+
+class RecordingTransport:
+    """Stands in for GatewayClient: records the request each call carried."""
+
+    def __init__(self):
+        self.requests = []
+
+    async def complete(self, prompt, system, *, session=None, request=None):
+        self.requests.append(request)
+        return {"text": '{"relevant":true,"reason":"worth keeping","goal":"File it."}'}
+
+
+@pytest.mark.asyncio
+async def test_subscription_provider_pins_both_the_gate_and_the_run(tmp_path):
+    """A subscription declares which model may see its content.
+
+    The ceiling has to cover the relevance gate as well as the run: the gate
+    reads the whole event to decide, so a gate on a hosted model has already
+    disclosed exactly what pinning the run was meant to protect.
+    """
+    store, runtime, transport = EventStore(tmp_path), RecordingRuntime(), RecordingTransport()
+    store.put_subscription(subscription(id="private", provider="ollama"))
+
+    async def default_llm(_prompt, _system):  # must not be reached
+        raise AssertionError("the subscription's provider was ignored")
+
+    result = await engine_for(store, runtime).process(
+        event(), llm=default_llm, transport=transport)
+
+    assert result["matched"] == 1
+    assert transport.requests == [{"provider": "ollama"}]
+    assert runtime.calls[0]["llm"] is not default_llm
+
+
+@pytest.mark.asyncio
+async def test_subscription_without_a_provider_keeps_the_process_default(tmp_path):
+    """Omitting the field is the previous behaviour, not a silent local pin."""
+    store, runtime, transport = EventStore(tmp_path), RecordingRuntime(), RecordingTransport()
+    store.put_subscription(subscription(id="unpinned"))
+    used = []
+
+    async def default_llm(_prompt, _system):
+        used.append(True)
+        return {"text": '{"relevant":false,"reason":"not worth it","goal":""}'}
+
+    await engine_for(store, runtime).process(event(), llm=default_llm, transport=transport)
+
+    assert used == [True]
+    assert transport.requests == []
+
+
+def engine_for(store, runtime):
+    return AutonomousEventEngine(store, runtime)
+
+
+@pytest.mark.asyncio
+async def test_relevance_gate_records_what_it_cost(tmp_path):
+    """The gate is metered, so daily_triage_budget can actually bind.
+
+    Deciding not to act is not free, and a ceiling on the cost of *watching*
+    is worthless if the thing it bounds always reports zero.
+    """
+    store, runtime = EventStore(tmp_path), RecordingRuntime()
+    store.put_subscription(subscription(daily_triage_budget=1.0))
+
+    async def priced(_prompt, _system):
+        return {"text": '{"relevant":false,"reason":"not worth it","goal":""}',
+                "metered_calls": [{"cost_usd": 0.004}]}
+
+    await AutonomousEventEngine(store, runtime).process(event(), llm=priced)
+
+    decision = store.events()[0]["decisions"][0]
+    assert decision["triage_cost_usd"] == pytest.approx(0.004)

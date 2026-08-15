@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -99,6 +100,87 @@ class ChannelMessageBody(BaseModel):
         return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+# A channel message is delivered straight to the runtime, which is the right
+# shape for "do this for me" but the wrong one for "here is a link". A link is a
+# fact about the world, and facts belong on the subscription path, where a human
+# wrote down what may be acted on and a governor bounds the window. Routing them
+# here is what makes an ignored link leave a recorded reason instead of nothing.
+_URL = re.compile(r"https?://[^\s<>\"')\]]+")
+
+#: Bound the fan-out. One message pasting forty links is one message, but it is
+#: forty triage decisions, and the per-source rate limit is not a per-message one.
+MAX_LINKS_PER_MESSAGE = 5
+
+
+def _urls_in(text: str) -> list[str]:
+    """Distinct URLs, in order, with trailing sentence punctuation removed."""
+    seen: dict[str, None] = {}
+    for match in _URL.findall(text or ""):
+        seen.setdefault(match.rstrip(".,;:!?"), None)
+    return list(seen)
+
+
+def _conversation_of(body: ChannelMessageBody) -> str:
+    """The narrowest conversation id the adapter gave us.
+
+    The gateway has no conversation-level scoping -- ``allowed_senders`` filters
+    by sender and nothing filters by room -- so the subscription's ``sources``
+    pattern is the only place it can live, and that means composing the id here.
+    Telegram and WhatsApp carry no room id at all and fall through to the sender,
+    which is correct: both are one-to-one with the bot.
+    """
+    for key in ("slack_channel_id", "guild_id", "room_id"):
+        value = body.metadata.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    # Deliberately not thread_id: its meaning is per-adapter and one of them is
+    # actively harmful here. IMAP sets it to the Message-ID, which is unique per
+    # email, so using it would mint a fresh source for every message and quietly
+    # turn the per-source rate limit into no limit at all.
+    return body.channel_user_id.strip()
+
+
+def _link_verdict_reply(body: ChannelMessageBody,
+                        verdicts: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+    """Say what was filed and what was not, and why not.
+
+    The refusal is the interesting half. An assistant that silently drops a link
+    is indistinguishable from one that never saw it.
+    """
+    lines: list[str] = []
+    for url, outcome in verdicts:
+        short = url if len(url) <= 60 else url[:57] + "..."
+        if outcome.get("refused"):
+            lines.append(f"- {short}: refused by {outcome.get('control')} ({outcome.get('reason')})")
+            continue
+        if outcome.get("duplicate"):
+            lines.append(f"- {short}: already seen, not re-filed")
+            continue
+        for decision in outcome.get("decisions", []):
+            if decision.get("refused_by"):
+                lines.append(f"- {short}: stopped by {decision['refused_by']}"
+                             f" ({decision.get('refusal_reason')})")
+            elif decision.get("run_status") == "waiting":
+                # A parked run is not a filed one. Saying "filed" here made the
+                # agent look like it had decided when it was in fact waiting for
+                # a person -- the opposite of what happened, and it hid the run
+                # id needed to confirm the same run later resumed.
+                lines.append(f"- {short}: waiting for your approval"
+                             f" [Run: {decision.get('run_id')}]")
+            elif decision.get("relevant"):
+                lines.append(f"- {short}: filed ({decision.get('reason', '')[:120]})")
+            else:
+                lines.append(f"- {short}: skipped ({decision.get('reason', '')[:120]})")
+    return {
+        "channel": body.channel,
+        "channel_user_id": body.channel_user_id,
+        "text": "\n".join(lines) or "No subscription covers links from here.",
+        "attachments": [],
+        "voice_audio_ref": None,
+        "thread_id": body.thread_id,
+    }
+
+
 def _channel_reply(body: ChannelMessageBody, result: dict[str, Any],
                    human_gates: set[str] | None = None) -> dict[str, Any]:
     if result["status"] == "completed":
@@ -114,7 +196,12 @@ def _channel_reply(body: ChannelMessageBody, result: dict[str, Any],
         if len(approvals) == 1 and approvals[0].get("question"):
             choices = approvals[0].get("choices") or []
             suffix = f" Choices: {', '.join(choices)}" if choices else ""
-            text = f"Approval needed: {approvals[0]['question']}{suffix}"
+            # Carry the run id into the message itself. Answering an approval is
+            # the one moment a person needs to identify the run -- to see that the
+            # work resumed rather than restarted -- and making them go and look it
+            # up somewhere else is how that proof gets skipped.
+            text = (f"Approval needed: {approvals[0]['question']}{suffix}"
+                    f" [Run: {result['run_id']}]")
         else:
             text = f"Work started and waiting for an external result. Run: {result['run_id']}"
     else:
@@ -246,6 +333,57 @@ async def channel_message(
             "reply": reply,
         })
         return reply
+
+    # Links are facts, not requests: route them through the subscription path so
+    # a human-written instruction decides whether they deserve work, the governor
+    # bounds the window, and every "no" is recorded. Anything else -- a direct
+    # question, a command -- keeps the request/response path below unchanged.
+    links = _urls_in(body.text or "")[:MAX_LINKS_PER_MESSAGE]
+    if links:
+        verdicts: list[tuple[str, dict[str, Any]]] = []
+        for index, url in enumerate(links):
+            derived = EventEnvelope.model_validate({
+                "id": f"{event_id}:{index}",
+                # The source string is the only conversation scoping available;
+                # _matches() globs it, so sources: ["discord:*"] works.
+                "source": f"{body.channel}:{_conversation_of(body)}",
+                "type": "link.shared",
+                "subject": url[:2_000],
+                "occurred_at": body.arrived_at.isoformat(),
+                "observed_at": datetime.now(UTC).isoformat(),
+                # Without an actor the agent cannot recognise its own echo.
+                "actor": body.channel_user_id,
+                "data": {
+                    "url": url,
+                    "text": body.text or "",
+                    "sender": body.user_handle or body.channel_user_id,
+                    # Carried so a later reply in this same conversation can still
+                    # find a parked approval: _waiting_channel_approval matches on
+                    # exactly these three keys.
+                    "channel": body.channel,
+                    "channel_user_id": body.channel_user_id,
+                    "thread_id": body.thread_id,
+                },
+            })
+            verdicts.append((url, await request.app.state.event_engine.process(
+                derived,
+                llm=lambda prompt, system: gateway_text_llm(request.app, prompt, system),
+                transport=request.app.state.gateway,
+            )))
+
+        # A link nobody subscribed to is not "handled" -- fall through and let the
+        # runtime answer it as an ordinary message rather than silently dropping it.
+        if any(outcome.get("matched") or outcome.get("refused") or outcome.get("duplicate")
+               for _, outcome in verdicts):
+            reply = _link_verdict_reply(body, verdicts)
+            request.app.state.event_store.add_decision(source, event_id, {
+                "subscription_id": "channel-links",
+                "relevant": True,
+                "reason": f"{len(links)} link(s) routed to the subscription path.",
+                "goal": body.text or "",
+                "reply": reply,
+            })
+            return reply
 
     prompt = body.text or "Respond to the attached channel message."
     initial_evidence = {"channel_message": body.model_dump(mode="json")}

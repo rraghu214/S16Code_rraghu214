@@ -16,13 +16,28 @@ either a quiet night or a dead watcher, and those must not look the same.
 """
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .governor import AutonomyGovernor
 from .store import EventStore
 
-STALE_AFTER_SECONDS = 900
+
+def _stale_after_default() -> int:
+    """How long silence may last before it is treated as an alarm.
+
+    This is a deployment choice, not a constant: it should be a small multiple
+    of how often events are actually expected. A watcher on a busy webhook that
+    has said nothing for a minute is already suspicious; one on a quiet mailbox
+    is not. Configurable so the threshold can match the traffic instead of the
+    traffic having to match the threshold.
+    """
+    raw = os.getenv("S16_LIVENESS_STALE_SECONDS", "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else 900
+
+
+STALE_AFTER_SECONDS = _stale_after_default()
 
 
 def liveness_status(store: EventStore, *, now: datetime | None = None,

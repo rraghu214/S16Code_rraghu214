@@ -13,3 +13,9 @@ htmlcov/
 *.db
 proofs/out/
 .DS_Store
+
+# Agent runtime output. sandbox/ holds the rendered catalogue, which contains
+# real links, real sender addresses and real timestamps -- everything the
+# assistant was pointed at. It is generated, never authored.
+sandbox/
+.claude/

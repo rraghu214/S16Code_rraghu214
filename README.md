@@ -1,5 +1,7 @@
 # S16Code — a general live-graph agent
 
+> **Running the Session 16 Part 1 executive assistant?** Start-up order, reset steps and per-channel verification are in [RUNBOOK.md](RUNBOOK.md).
+
 S16Code takes S15's durable graph, memory, A2A, UI, budget controller and
 telemetry as its foundation, then replaces the task-shaped planner with a
 general capability-driven agent loop. `glc_v5` connects that loop to every
@@ -69,13 +71,23 @@ adds for the case where nobody did, and where nobody is watching either.
   `daily_budget`, `max_runs_per_day` and `daily_triage_budget` do. It also
   rate-limits per source and refuses events this agent itself caused, so a reply
   into a watched mailbox cannot become a loop.
-- Every refusal is recorded. A control that prevents work leaves no other trace,
-  and without the record a well-defended night and an idle night look identical.
+- A subscription also names a `provider`. That is a ceiling on **disclosure**
+  rather than spend: it says which model this subscription's events may reach at
+  all, and it is applied to the relevance gate as well as the run
+  (`s16code/events/engine.py:86-99`), because a gate that read the event has
+  already disclosed it.
+- Every refusal is recorded and served at `GET /v1/agent/refusals?hours=N`. A
+  control that prevents work leaves no other trace, and without the record a
+  well-defended night and an idle night look identical.
 - `s16code/events/lease.py` stops a periodic trigger overlapping itself, and
   reports a skip rather than silently doing nothing.
 - `s16code/events/report.py` publishes a heartbeat (`GET /v1/agent/liveness`,
   `503` once stale) and the human-readable account of a period nobody watched
   (`GET /v1/agent/report`), which costs **watching** separately from **doing**.
+- `GET /console` is the operator page: a read-only projection of the durable
+  history — liveness beat, live event tape, refusals, subscriptions and the
+  rendered report. It has no write control by design. An operator page that could
+  grant authority would be the exact hole the control plane exists to close.
 
 ```bash
 uv run python proofs/p_naive_vs_bounded.py    # naive vs gated vs bounded, same stream
@@ -84,6 +96,122 @@ uv run python proofs/p_autonomy_bounds.py     # seven properties of the ceilings
 
 Both take their event stream and every ceiling as arguments, so they run against
 work they have never seen, and both exit non-zero on failure.
+
+## The assistant running on it
+
+Everything above is machinery. The Session 16 Part 1 build is the assistant that
+uses it: it watches five real channels — **WhatsApp, Telegram, Discord, IMAP and
+a local microphone** — and does one job. Decide which shared links are worth
+keeping, file those, and say why it dropped the rest. Start-up order, reset and
+per-channel verification are in [RUNBOOK.md](RUNBOOK.md).
+
+```mermaid
+flowchart TB
+    WA[WhatsApp]:::src --> GW
+    TG[Telegram]:::src --> GW
+    DC[Discord]:::src --> GW
+    IM[IMAP mailbox]:::src --> GW
+    MC[Microphone]:::src --> GW
+
+    GW["<b>glc_v5 gateway</b> :8111<br/>owns every credential<br/>and channel adapter"]:::gw
+    GW -->|one shared envelope| AG
+
+    AG["<b>link organizer agent</b> :8113<br/>owns the decisions<br/>holds no credentials"]:::agent
+    AG --> URL{"message<br/>contains a URL?"}
+
+    URL -->|no| CHAT["ordinary agent loop<br/>answer the person"]:::plain
+    URL -->|yes| EVT["one <b>link.shared</b> event<br/>per link"]:::plain
+
+    EVT --> GOV{"<b>governor</b><br/>rate limit · self-trigger<br/>daily ceilings"}
+    GOV -->|refused| LEDG[("refusal ledger<br/>what a rule stopped")]:::store
+
+    GOV -->|admitted| MATCH{"matches a<br/><b>subscription</b>?<br/><i>free string filter</i>"}
+    MATCH -->|no| CHAT
+
+    MATCH -->|yes| GATE{"<b>relevance gate</b><br/>worth keeping?<br/><i>one cheap model call</i>"}
+    GATE -->|"skip + reason"| EV[("event store<br/>every decision, with why")]:::store
+    GATE -->|"keep"| RUN["run: file it,<br/>or ask a human first"]:::plain
+    RUN --> EV
+    LEDG --> EV
+
+    EV --> CAT["<b>link-catalogue.md</b><br/>kept links, grouped,<br/>with origin and sender"]:::out
+    EV --> REP["<b>morning report</b><br/>arrived · acted · ignored<br/>· blocked · cost"]:::out
+    EV --> LIV["<b>liveness</b><br/>200 while noticing<br/>503 once silent"]:::out
+
+    classDef src fill:#e8f0fe,stroke:#5b8def,color:#1a2c4e
+    classDef gw fill:#fff4e5,stroke:#e8a33d,color:#4a3208
+    classDef agent fill:#e9f7ee,stroke:#3fa66a,color:#10301d
+    classDef store fill:#f3eafe,stroke:#9a6fd4,color:#2e1b4d
+    classDef out fill:#fdeef0,stroke:#d4677a,color:#4d1b25
+    classDef plain fill:#f5f6f8,stroke:#9aa3b0,color:#1f2430
+```
+
+Two properties of that picture matter more than the boxes. **Authority flows only
+from the subscription**, never from an arriving message — nothing a sender writes
+can widen what the agent may do. And **every "no" lands in the store**: a link the
+gate skipped carries its reason, and work a ceiling prevented is recorded in the
+refusal ledger, because refused work leaves no other trace — nothing spent, nothing
+logged, nothing to find later.
+
+A message is not the unit of work. `POST /v1/agent/channel-messages` extracts
+every URL and derives one `link.shared` event per link (`s16code/routes.py:344`),
+so three links in one message become three independently judged decisions and one
+reply. A URL already filed is reported as a duplicate rather than filed twice,
+and a link no subscription claims falls through to the ordinary agent loop
+instead of being dropped in silence. The reply names what was refused and by
+which control, because an assistant that quietly discards a link is
+indistinguishable from one that never saw it.
+
+`tools/put_subscriptions.py` installs the two subscriptions that grant all of
+this authority. Two rather than one, because authority is scoped per subscription
+and the two halves are not governed alike:
+
+|  | `links-private` | `links-public` |
+|---|---|---|
+| sources | `local_mic:*` | `discord:*`, `imap:*`, `whatsapp:*`, `telegram:*` |
+| may do | `request_approval`, `write_file` | `request_approval`, `write_file` |
+| ceilings | 40 runs/day, $0.05/day triage | $0.02/run, $0.50/day, 60 runs/day, $0.10/day triage |
+
+The private tier carries no dollar ceiling on purpose. It is the tier meant for a
+local model, where a dollar ceiling projects $0.00 and decorates instead of
+binding, so the run count and the per-source rate limit are what actually hold.
+Both shipped subscriptions currently pin `provider: gemini`: on this machine
+qwen2.5:7b judges well — its verdicts quote the instruction correctly — but it
+emits planner patches with invented fields, so the judgement is sound while every
+run fails validation. The disclosure ceiling is enforced either way; only the
+value differs, and the file says so rather than implying a local tier that is not
+running.
+
+The instruction is the policy, and it chooses between exactly two shapes: file
+the link, or — when the sender explicitly asks the owner to decide —
+`request_approval` and wait. The second is what exercises wait/resume: a reply in
+the same thread satisfies the parked approval node and the original run finishes
+under its original `run_id`.
+
+The catalogue is rendered, not written by a model:
+
+```bash
+uv run python tools/render_catalog.py               # write sandbox/link-catalogue.md
+uv run python tools/render_catalog.py --watch 30    # keep it current during a demo
+uv run python tools/render_catalog.py --hours 24    # window it by event time
+```
+
+The agent could be told to maintain that markdown itself, and it would — grouping,
+ordering and phrasing drifting on every run. So the judgement stays the model's
+(filed or skipped, and why) and the presentation stays deterministic: the
+renderer reads the recorded decisions and rewrites the document from them. Same
+data, same bytes. It reads only — it cannot file, unfile or re-judge anything.
+The **Skipped** section is the point rather than an appendix; it is the evidence
+that the agent is judging rather than hoarding.
+
+What an operator actually looks at:
+
+```bash
+curl -s "http://127.0.0.1:8113/v1/agent/events?after=0"
+curl -s "http://127.0.0.1:8113/v1/agent/refusals?hours=1"
+curl -s "http://127.0.0.1:8113/v1/agent/report?hours=1&fmt=markdown"
+# and http://127.0.0.1:8113/console for the same facts as a page
+```
 
 ## Inherited production boundaries
 
@@ -215,6 +343,19 @@ The hard guarantees are narrower and enforced in code: authority validation,
 existing-evidence dependencies, bounded graph/frontier size, deduplication,
 metered provider calls, budget admission, durable outcomes, and no research
 synthesis without readable sources.
+
+The morning report separates the two bills deliberately, and only one of them is
+currently real. `cost_of_watching_usd` is summed from the per-decision triage
+cost recorded at the gate. `cost_of_doing_usd` is whatever a run reports as
+`spend_usd` (`s16code/events/engine.py:163-164`), and this build's runtime
+reports none, so it reads `$0.00`. The authoritative money record is the
+gateway's own ledger, `GET /v1/cost/by_principal` on glc_v5.
+
+Liveness is event-driven in the same literal way: `store.beat()` is called in one
+place, on arrival (`s16code/events/engine.py:70`). There is no startup beat and
+no timer, so a `503` means *silence* — a running process that has heard nothing
+for `STALE_AFTER_SECONDS`. A killed process refuses the connection instead, which
+is a different signal and a cruder one.
 
 Provider adapters vary in how much live external delivery they implement. The
 connection proof establishes that every registered adapter reaches the S16 seam;

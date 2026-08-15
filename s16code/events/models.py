@@ -36,6 +36,12 @@ class Subscription(BaseModel):
     user_id: str | None = Field(default=None, max_length=200)
     agent_id: str | None = Field(default="s16-autonomous", max_length=200)
     allowed_side_effects: list[str] = Field(default_factory=list, max_length=50)
+    # Which gateway provider may see this subscription's events. A ceiling on
+    # disclosure, not on spend: a subscription watching private channels can be
+    # pinned to a local model so its content never leaves the machine, while a
+    # subscription over public sources uses a hosted one. Unset inherits the
+    # process default (S16_GATEWAY_PROVIDER), which is the previous behaviour.
+    provider: str | None = Field(default=None, min_length=1, max_length=100)
     # Per-run ceiling, inherited from Session 15's hard controller.
     budget: float | None = Field(default=None, gt=0)
     # Per-window ceilings. A per-run ceiling does not bound an agent that starts

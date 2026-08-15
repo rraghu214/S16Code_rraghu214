@@ -26,7 +26,14 @@ class GatewayClient:
 
     def __init__(self, base_url: str | None = None, *, client: httpx.AsyncClient | None = None) -> None:
         self.base_url = (base_url or os.getenv("GLC_BASE_URL", "http://127.0.0.1:8111")).rstrip("/")
-        self._client = client or httpx.AsyncClient(timeout=120)
+        # 120s is generous for a hosted model and far too tight for a local one:
+        # a CPU-served model answering a planner-sized prompt can take minutes,
+        # and the timeout surfaces as "planner call failed visibly: ReadTimeout"
+        # -- a failed run rather than a slow one, which reads like a bug in the
+        # agent instead of a limit on the machine.
+        self._client = client or httpx.AsyncClient(
+            timeout=float(os.getenv("S16_GATEWAY_TIMEOUT", "120"))
+        )
         self._owns_client = client is None
 
     def _payload(self, prompt: str, system: str, request: dict[str, Any] | None) -> dict[str, Any]:
@@ -94,6 +101,10 @@ class GatewayClient:
             "cache_creation_input_tokens": body.get("cache_creation_input_tokens") or 0,
             "latency_ms": body.get("latency_ms"),
             "stop_reason": body.get("stop_reason"),
+            # The gateway prices every call and returns the breakdown. Dropping
+            # it here is what made the relevance gate look free: the meter that
+            # enforces daily_triage_budget had nothing to add up.
+            "cost_usd": float((body.get("cost") or {}).get("total_usd") or 0.0),
         }
 
     async def complete(
@@ -110,6 +121,16 @@ class GatewayClient:
         return {
             "text": result["text"], "provider": result["provider"], "model": result["model"],
             "input_tokens": result["input_tokens"], "output_tokens": result["output_tokens"],
+            # Reported in the budgeted controller's own shape (economics.controller
+            # METER_KEY), so a caller metering this path reads it the same way it
+            # reads a budgeted one and does not need to know which it got.
+            "metered_calls": [{
+                "cost_usd": result["cost_usd"],
+                "provider": result["provider"],
+                "model": result["model"],
+                "input_tokens": result["input_tokens"],
+                "output_tokens": result["output_tokens"],
+            }],
         }
 
     async def health(self) -> dict[str, Any]:
